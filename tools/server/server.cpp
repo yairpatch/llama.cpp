@@ -2708,6 +2708,11 @@ struct server_context {
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.reset();
 
+        // clear the KV/RS cache for this slot to ensure clean state
+        SLT_DBG(slot, "%s", "clearing memory cache for new task\n");
+        llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
+        slot.prompt.tokens.clear();
+
         if (!are_lora_equal(task.params.lora, slot.lora)) {
             // if lora has changed, check to see if the cache should be cleared
             if (lora_should_clear_cache(slot.lora, task.params.lora)) {

@@ -782,6 +782,9 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    def add_deepstack_layers(self, layers: Sequence[int]) -> None:
+        self.add_array(Keys.LLM.DEEPSTACK_LAYERS.format(arch=self.arch), layers)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 
@@ -1070,6 +1073,9 @@ class GGUFWriter:
 
     def add_vision_n_wa_pattern(self, value: int) -> None:
         self.add_uint32(Keys.ClipVision.N_WA_PATTERN, value)
+
+    def add_vision_deepstack_layers(self, layers: Sequence[int]) -> None:
+        self.add_array(Keys.ClipVision.DEEPSTACK_LAYERS, layers)
 
     # audio models
 
