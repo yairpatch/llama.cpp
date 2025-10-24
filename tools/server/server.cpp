@@ -5719,6 +5719,7 @@ int main(int argc, char ** argv) {
 
     clean_up();
     t.join();
+    llama_memory_breakdown_print(ctx_server.ctx);
 
     return 0;
 }
