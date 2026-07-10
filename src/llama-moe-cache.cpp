@@ -237,7 +237,11 @@ void llama_moe_cache::observe(int il, const int32_t * ids, int64_t n_used, int64
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t u = 0; u < n_used; ++u) {
             const int32_t e = ids[t * n_used + u];
-            if (e >= 0 && e < L.n_expert) L.counts[e] += 1.0f;
+            if (e >= 0 && e < L.n_expert) {
+                L.counts[e] += 1.0f;
+                win_total++;
+                if (L.slot_of[e] >= 0) win_hits++;
+            }
         }
     }
 
@@ -266,6 +270,8 @@ void llama_moe_cache::update() {
     // bound the synchronous CPU->VRAM copy volume per update; what does not fit
     // is picked up by later updates (spreads the initial fill over many updates)
     size_t copy_budget = promote_bytes;
+
+    filling = false;
 
     for (auto & [il, L] : layers) {
         // decay counters (EMA)
@@ -323,6 +329,10 @@ void llama_moe_cache::update() {
             changed = true;
         }
 
+        if (!free_slots.empty()) {
+            filling = true;
+        }
+
         if (changed) {
             upload_maps(L);
             n_promotions++;
@@ -335,10 +345,14 @@ void llama_moe_cache::update() {
         const llama_moe_cache_layer & L0 = layers.begin()->second;
         int filled = 0;
         for (int s = 0; s < L0.n_slots; ++s) filled += (L0.expert_in_slot[s] >= 0);
-        LLAMA_LOG_INFO("%s: update #%lld: %lld promotions so far; layer %d cache %d/%d slots filled\n",
+        LLAMA_LOG_INFO("%s: update #%lld: %lld promotions so far; layer %d cache %d/%d slots filled; window hit rate %.1f%% (%lld/%lld)\n",
                        __func__, (long long) n_updates, (long long) n_promotions,
-                       L0.il, filled, L0.n_slots);
+                       L0.il, filled, L0.n_slots,
+                       win_total > 0 ? 100.0 * win_hits / win_total : 0.0,
+                       (long long) win_hits, (long long) win_total);
     }
+    win_hits  = 0;
+    win_total = 0;
 }
 
 void llama_moe_cache::log_summary() const {

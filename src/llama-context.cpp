@@ -556,11 +556,12 @@ void llama_context::sched_reserve() {
 
     // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache).
     // create before reserving graphs so the worst-case reservation accounts for
-    // the extra split/mask nodes it inserts.
-    if (cparams.moe_cache_mb > 0) {
+    // the extra split/mask nodes it inserts. keep an existing cache (and its
+    // accumulated counters) across re-reservations.
+    if (cparams.moe_cache_mb > 0 && !moe_cache) {
         moe_cache = std::make_unique<llama_moe_cache>(model, (size_t) cparams.moe_cache_mb << 20);
-        cparams.moe_cache = moe_cache && moe_cache->enabled() ? moe_cache.get() : nullptr;
     }
+    cparams.moe_cache = moe_cache && moe_cache->enabled() ? moe_cache.get() : nullptr;
 
     llama_memory_context_ptr mctx;
     if (memory) {

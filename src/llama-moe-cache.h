@@ -106,8 +106,12 @@ struct llama_moe_cache {
 
     bool enabled() const { return buffer != nullptr && !layers.empty(); }
 
-    // whether enough tokens have accumulated to justify a hot-set refresh
-    bool due() const { return enabled() && tokens_since_update >= update_interval; }
+    // whether enough tokens have accumulated to justify a hot-set refresh;
+    // updates run more often while free slots remain so the cache warms up fast
+    bool due() const {
+        const int64_t interval = filling ? std::min<int64_t>(update_interval, 64) : update_interval;
+        return enabled() && tokens_since_update >= interval;
+    }
 
     // stats
     size_t vram_bytes() const { return used_bytes; }
@@ -145,6 +149,12 @@ private:
     // exceeds the resident's by this factor; without it the top-K boundary
     // churns every update when activation is near-uniform
     float  margin = 2.0f;
+
+    bool filling = true;  // free slots remain somewhere; shortens the update interval
+
+    // aggregate hit/total counters since the last update (verbose logging)
+    int64_t win_hits  = 0;
+    int64_t win_total = 0;
     int64_t tokens_since_update = 0;
     int64_t update_interval     = 256; // recompute hot set at most this often
     int64_t n_updates           = 0;
