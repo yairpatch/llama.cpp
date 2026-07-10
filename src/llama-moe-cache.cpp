@@ -71,9 +71,11 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     }
     buft = ggml_backend_dev_buffer_type(dev);
 
-    // collect cacheable layers
+    // collect cacheable layers; layers past n_layer (nextn/MTP) do not run in
+    // normal decode, so caching them wastes budget and their slots never fill
     std::vector<int> candidates;
-    for (size_t il = 0; il < model.layers.size(); ++il) {
+    const size_t n_layer_run = std::min<size_t>(model.layers.size(), model.hparams.n_layer());
+    for (size_t il = 0; il < n_layer_run; ++il) {
         ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
         if (layer_expert_tensors(model.layers[il], src) > 0) {
             candidates.push_back((int) il);
@@ -342,13 +344,17 @@ void llama_moe_cache::update() {
                   [&](int a, int b) { return L.counts[L.expert_in_slot[a]] < L.counts[L.expert_in_slot[b]]; });
 
         bool changed = false;
+        bool blocked = false;
         size_t i_res = 0;
 
         for (int i = 0; i < topk; ++i) {
             const int e = order[i];
             if (L.counts[e] <= 0.0f) break;
             if (L.slot_of[e] >= 0) continue;
-            if (per_expert_bytes > copy_budget) break;
+            if (per_expert_bytes > copy_budget) {
+                blocked = true;
+                break;
+            }
 
             int slot = -1;
             if (!free_slots.empty()) {
@@ -372,7 +378,10 @@ void llama_moe_cache::update() {
             changed = true;
         }
 
-        if (!free_slots.empty()) {
+        // still warming up only if free slots would have been filled were it
+        // not for the copy budget; free slots without eligible candidates
+        // (e.g. fewer active experts than slots) do not count
+        if (blocked && !free_slots.empty()) {
             filling = true;
         }
 
