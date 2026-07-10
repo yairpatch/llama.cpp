@@ -307,7 +307,7 @@ void llama_moe_cache::harvest() {
 
 void llama_moe_cache::update() {
     if (!enabled()) return;
-    if (tokens_since_update < update_interval) return;
+    if (tokens_since_update < interval_eff()) return;
     tokens_since_update = 0;
 
     // bound the synchronous CPU->VRAM copy volume per update; what does not fit

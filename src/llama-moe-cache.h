@@ -118,10 +118,7 @@ struct llama_moe_cache {
 
     // whether enough tokens have accumulated to justify a hot-set refresh;
     // updates run more often while free slots remain so the cache warms up fast
-    bool due() const {
-        const int64_t interval = filling ? std::min<int64_t>(update_interval, 64) : update_interval;
-        return enabled() && tokens_since_update >= interval;
-    }
+    bool due() const { return enabled() && tokens_since_update >= interval_eff(); }
 
     // stats
     size_t vram_bytes() const { return used_bytes; }
@@ -132,6 +129,10 @@ private:
     void alloc_tensors();
     void upload_maps(llama_moe_cache_layer & L);
     void promote(llama_moe_cache_layer & L, int expert, int slot);
+
+    int64_t interval_eff() const {
+        return filling ? std::min<int64_t>(update_interval, 64) : update_interval;
+    }
 
     const llama_model & model;
 
@@ -152,8 +153,10 @@ private:
     size_t used_bytes    = 0;
     size_t promote_bytes = 0;  // max CPU->VRAM copy volume per update()
 
-    // exponential decay applied to counters each update() (half-life ~1-2k tokens)
-    float  decay = 0.999f;
+    // exponential decay applied to counters each update(); at the default
+    // 256-token interval this forgets with a half-life of ~13 updates (~3k
+    // tokens), letting the hot set track topic drift within a generation
+    float  decay = 0.95f;
 
     // hysteresis: displace a resident expert only when the candidate's count
     // exceeds the resident's by this factor; without it the top-K boundary
