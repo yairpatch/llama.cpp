@@ -72,24 +72,27 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     buft = ggml_backend_dev_buffer_type(dev);
 
     // never overcommit the device: silent driver paging (WDDM) costs far more
-    // than a smaller cache. the reserve covers compute buffers, which are not
-    // allocated yet at this point, plus driver slack.
+    // than a smaller cache. model, context and compute buffers are already
+    // allocated at this point, so free memory is measured, not projected; the
+    // reserve only covers driver/desktop slack.
     {
         size_t dev_free = 0, dev_total = 0;
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-        size_t reserve = 1536ull << 20;
+        size_t reserve = 512ull << 20;
         if (const char * s = getenv("MOE_CACHE_RESERVE_MB")) {
             reserve = (size_t) std::max<int64_t>(0, atoll(s)) << 20;
         }
-        if (dev_free <= reserve || (dev_free - reserve) < (64ull << 20)) {
-            LLAMA_LOG_WARN("%s: only %zu MiB free on %s (%zu MiB reserved); MoE expert cache disabled\n",
-                           __func__, dev_free >> 20, ggml_backend_dev_name(dev), reserve >> 20);
+        const size_t avail = dev_free > reserve ? dev_free - reserve : 0;
+        LLAMA_LOG_INFO("%s: %s: %zu MiB free, %zu MiB reserved, %zu MiB usable for the MoE expert cache (%zu MiB requested)\n",
+                       __func__, ggml_backend_dev_name(dev), dev_free >> 20, reserve >> 20, avail >> 20, budget_bytes >> 20);
+        if (avail < (64ull << 20)) {
+            LLAMA_LOG_WARN("%s: not enough free device memory; MoE expert cache disabled\n", __func__);
             return;
         }
-        if (budget_bytes > dev_free - reserve) {
-            LLAMA_LOG_WARN("%s: MoE cache budget %zu MiB exceeds free device memory (%zu MiB free, %zu MiB reserved); clamping to %zu MiB\n",
-                           __func__, budget_bytes >> 20, dev_free >> 20, reserve >> 20, (dev_free - reserve) >> 20);
-            budget_bytes = dev_free - reserve;
+        if (budget_bytes > avail) {
+            LLAMA_LOG_WARN("%s: clamping MoE cache budget %zu MiB -> %zu MiB\n",
+                           __func__, budget_bytes >> 20, avail >> 20);
+            budget_bytes = avail;
         }
     }
 
