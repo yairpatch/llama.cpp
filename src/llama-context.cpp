@@ -550,8 +550,8 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
-    // the tagged tensors point into the graphs that were just freed
-    moe_cache_sel.clear();
+    // any pending ids were drained by the synchronize() above
+    moe_cache_graph_has_ids   = false;
     moe_cache_observe_pending = false;
 
     // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache).
@@ -1290,12 +1290,7 @@ void llama_context::moe_cache_harvest() {
     }
     moe_cache_observe_pending = false;
 
-    for (const auto & [il, t] : moe_cache_sel) {
-        const size_t nbytes = ggml_nbytes(t);
-        moe_cache_ids_host.resize(nbytes);
-        ggml_backend_tensor_get(t, moe_cache_ids_host.data(), 0, nbytes);
-        moe_cache->observe(il, (const int32_t *) moe_cache_ids_host.data(), t->ne[0], t->ne[1]);
-    }
+    moe_cache->harvest();
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -1364,15 +1359,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // collect the selected-expert tensors tagged by build_moe_ffn; their ids
+        // detect whether build_moe_ffn tagged selected-expert writes; their ids
         // are read back after compute to drive the MoE cache counters
-        moe_cache_sel.clear();
+        moe_cache_graph_has_ids = false;
         if (moe_cache) {
             static const char * prefix = "moe_cache_sel.";
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * t = ggml_graph_node(gf, i);
-                if (strncmp(t->name, prefix, strlen(prefix)) == 0) {
-                    moe_cache_sel.emplace_back(atoi(t->name + strlen(prefix)), t);
+                if (strncmp(ggml_graph_node(gf, i)->name, prefix, strlen(prefix)) == 0) {
+                    moe_cache_graph_has_ids = true;
+                    break;
                 }
             }
         }
@@ -1395,7 +1390,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (!moe_cache_sel.empty()) {
+    if (moe_cache_graph_has_ids) {
         moe_cache_observe_pending = true;
     }
 

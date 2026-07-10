@@ -1971,25 +1971,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * cache_ids_cpu  = nullptr;
     ggml_tensor * cache_mask_cpu = nullptr;
     if (use_moe_cache) {
-        const int64_t K = mcL->n_slots;
-
-        ggml_tensor * sel = ggml_cont(ctx0, selected_experts); // [n_expert_used, 1] I32
+        // stash the selected ids in the cache's persistent ids tensor; the host
+        // reads all layers back in one transfer after compute to feed the
+        // activation counters
+        ggml_tensor * ids_dst = ggml_view_1d(ctx0, mcL->ids_all, n_expert_used,
+                                             (size_t) mcL->harvest_row * mcL->ids_all->nb[1]);
+        ggml_tensor * sel = ggml_cpy(ctx0, selected_experts, ids_dst); // [n_expert_used] I32
         ggml_set_name(sel, (std::string("moe_cache_sel.") + std::to_string(il)).c_str());
-        // read back after compute to feed the activation counters; the output flag
-        // keeps the graph allocator from reusing this memory before it is read
-        ggml_set_output(sel);
         ggml_build_forward_expand(gf, sel);
-        ggml_tensor * sel1d = ggml_reshape_1d(ctx0, sel, n_expert_used);
 
-        // GPU ids: cached -> its slot; miss (slot-position iex) -> distinct zero-slot K+iex.
-        // gpu_map holds slot+0.5 (cached) or -0.5 (miss); step() selects, cast truncates.
-        ggml_tensor * gathered = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map, sel1d), n_expert_used); // F32
-        ggml_tensor * iex      = ggml_arange(ctx0, (float) K, (float) (K + n_expert_used), 1.0f);                // F32 [n_used]
-        ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                     // 1 if cached
-        ggml_tensor * gpu_id_f = ggml_add(ctx0, iex, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, iex)));
+        // GPU ids: cached -> its slot; miss (slot-position i) -> distinct zero-slot
+        // iex[i] = K+i. gpu_map holds slot+0.5 (cached) or -0.5 (miss); step()
+        // selects, cast truncates.
+        ggml_tensor * gathered = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map, sel), n_expert_used); // F32
+        ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                    // 1 if cached
+        ggml_tensor * gpu_id_f = ggml_add(ctx0, mcL->iex, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, mcL->iex)));
         cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32), n_expert_used, 1);
 
-        cache_ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel1d), n_expert_used, 1);
+        cache_ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, 1);
         // 1 for misses, 0 for cached experts
         cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selc, -1.0f, 1.0f), 1, n_expert_used, 1);
     }

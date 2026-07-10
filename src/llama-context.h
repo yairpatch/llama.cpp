@@ -292,14 +292,13 @@ private:
     // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache); null when disabled
     std::unique_ptr<llama_moe_cache> moe_cache;
 
-    // selected-expert tensors tagged by build_moe_ffn in the current graph, and
-    // whether the last computed graph has ids not yet fed into the cache counters
-    std::vector<std::pair<int, ggml_tensor *>> moe_cache_sel;
+    // whether the current graph writes selected-expert ids for the cache, and
+    // whether the last computed graph has ids not yet fed into the counters
+    bool moe_cache_graph_has_ids   = false;
     bool moe_cache_observe_pending = false;
-    std::vector<char> moe_cache_ids_host; // scratch for reading selected-expert ids
 
-    // read the tagged selected-expert ids of the last computed graph and feed
-    // them into the cache counters; the backends must be synchronized
+    // feed the last computed graph's selected-expert ids into the cache
+    // counters; the backends must be synchronized
     void moe_cache_harvest();
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])

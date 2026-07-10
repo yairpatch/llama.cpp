@@ -54,6 +54,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     if (const char * s = getenv("MOE_CACHE_INTERVAL"))   update_interval = std::max<int64_t>(1, atoll(s));
     if (const char * s = getenv("MOE_CACHE_DECAY"))      decay           = (float) atof(s);
     if (const char * s = getenv("MOE_CACHE_PROMOTE_MB")) promote_bytes   = (size_t) std::max<int64_t>(1, atoll(s)) << 20;
+    if (const char * s = getenv("MOE_CACHE_MARGIN"))     margin          = std::max(1.0f, (float) atof(s));
 
     // pick a GPU device / buffer type to host the cache
     ggml_backend_dev_t dev = nullptr;
@@ -136,8 +137,8 @@ void llama_moe_cache::register_layer(int il, int n_slots) {
 }
 
 void llama_moe_cache::alloc_tensors() {
-    // metadata context: per layer -> up to 3 vram + 2 maps
-    const size_t n_tensors = layers.size() * (LLAMA_MOE_MAX_ROLES + 2);
+    // metadata context: per layer -> up to 3 vram + 2 maps + iex, plus ids_all
+    const size_t n_tensors = layers.size() * (LLAMA_MOE_MAX_ROLES + 3);
     ggml_init_params ip = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 8),
         /*.mem_buffer =*/ nullptr,
@@ -161,6 +162,16 @@ void llama_moe_cache::alloc_tensors() {
         // by get_rows(map, selected_experts)
         L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
         L.cpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+        L.iex     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_used);
+    }
+
+    ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, layers.size());
+    {
+        int row = 0;
+        for (auto & [il, L] : layers) {
+            L.ids_all     = ids_all;
+            L.harvest_row = row++;
+        }
     }
 
     buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -181,7 +192,14 @@ void llama_moe_cache::alloc_tensors() {
             if (zero.size() < nbytes) zero.assign(nbytes, 0);
             ggml_backend_tensor_set(L.vram[r], zero.data(), 0, nbytes);
         }
+        std::vector<float> iex(n_used);
+        for (int i = 0; i < n_used; ++i) iex[i] = (float) (L.n_slots + i);
+        ggml_backend_tensor_set(L.iex, iex.data(), 0, iex.size() * sizeof(float));
         upload_maps(L); // defaults from slot_of == all -1
+    }
+    {
+        const std::vector<int32_t> zero_ids(ggml_nelements(ids_all), 0);
+        ggml_backend_tensor_set(ids_all, zero_ids.data(), 0, ggml_nbytes(ids_all));
     }
 
     log_summary();
@@ -229,6 +247,17 @@ void llama_moe_cache::observe(int il, const int32_t * ids, int64_t n_used, int64
     }
 }
 
+void llama_moe_cache::harvest() {
+    if (!enabled()) return;
+
+    ids_host.resize(ggml_nelements(ids_all));
+    ggml_backend_tensor_get(ids_all, ids_host.data(), 0, ggml_nbytes(ids_all));
+
+    for (auto & [il, L] : layers) {
+        observe(il, ids_host.data() + (size_t) L.harvest_row * n_used, n_used, 1);
+    }
+}
+
 void llama_moe_cache::update() {
     if (!enabled()) return;
     if (tokens_since_update < update_interval) return;
@@ -247,46 +276,45 @@ void llama_moe_cache::update() {
         size_t per_expert_bytes = 0;
         for (int r = 0; r < L.n_roles; ++r) per_expert_bytes += L.src[r]->nb[2];
 
-        // desired hot set: top-K experts by count (count > 0)
+        // candidate experts, hottest first
         const int topk = std::min<int>(K, L.n_expert);
         std::vector<int> order(L.n_expert);
         std::iota(order.begin(), order.end(), 0);
         std::partial_sort(order.begin(), order.begin() + topk, order.end(),
                           [&](int a, int b) { return L.counts[a] > L.counts[b]; });
 
-        std::vector<bool> want(L.n_expert, false);
-        for (int i = 0; i < topk; ++i) {
-            if (L.counts[order[i]] > 0.0f) want[order[i]] = true;
-        }
-
-        // fillable slots: free ones first, then unwanted residents, coldest first.
-        // residents are evicted lazily, only when their slot is actually refilled,
-        // so they keep serving hits while promotions wait on the copy budget.
-        std::vector<int> avail;
+        // free slots, and resident slots sorted coldest first
+        std::vector<int> free_slots;
+        std::vector<int> res_slots;
         for (int slot = 0; slot < K; ++slot) {
-            if (L.expert_in_slot[slot] < 0) avail.push_back(slot);
+            (L.expert_in_slot[slot] < 0 ? free_slots : res_slots).push_back(slot);
         }
-        std::vector<int> evictable;
-        for (int slot = 0; slot < K; ++slot) {
-            const int e = L.expert_in_slot[slot];
-            if (e >= 0 && !want[e]) evictable.push_back(slot);
-        }
-        std::sort(evictable.begin(), evictable.end(),
+        std::sort(res_slots.begin(), res_slots.end(),
                   [&](int a, int b) { return L.counts[L.expert_in_slot[a]] < L.counts[L.expert_in_slot[b]]; });
-        avail.insert(avail.end(), evictable.begin(), evictable.end());
 
         bool changed = false;
+        size_t i_res = 0;
 
-        // promote newly-wanted experts, hottest first
-        size_t next = 0;
-        for (int i = 0; i < topk && next < avail.size(); ++i) {
+        for (int i = 0; i < topk; ++i) {
             const int e = order[i];
-            if (!want[e] || L.slot_of[e] >= 0) continue;
+            if (L.counts[e] <= 0.0f) break;
+            if (L.slot_of[e] >= 0) continue;
             if (per_expert_bytes > copy_budget) break;
 
-            const int slot = avail[next++];
-            const int old  = L.expert_in_slot[slot];
-            if (old >= 0) L.slot_of[old] = -1;
+            int slot = -1;
+            if (!free_slots.empty()) {
+                slot = free_slots.back();
+                free_slots.pop_back();
+            } else {
+                if (i_res >= res_slots.size()) break;
+                const int r = L.expert_in_slot[res_slots[i_res]];
+                // hysteresis: displace a resident only when the candidate is
+                // clearly hotter; candidates are sorted, so the first one that
+                // fails ends the scan
+                if (L.counts[e] <= margin * L.counts[r]) break;
+                slot = res_slots[i_res++];
+                L.slot_of[r] = -1;
+            }
 
             promote(L, e, slot);
             L.slot_of[e] = slot;

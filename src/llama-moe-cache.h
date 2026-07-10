@@ -63,6 +63,13 @@ struct llama_moe_cache_layer {
     ggml_tensor * gpu_map = nullptr;
     ggml_tensor * cpu_map = nullptr;
 
+    // constant [K+0, .., K+n_used-1] (F32), the per-position zero-slot ids
+    ggml_tensor * iex = nullptr;
+
+    // row of the cache-wide ids tensor this layer's selected ids are copied to
+    ggml_tensor * ids_all     = nullptr;
+    int           harvest_row = -1;
+
     // host state
     std::vector<float> counts;         // decayed activation counters [n_expert]
     std::vector<int>   slot_of;        // expert -> slot, or -1 [n_expert]
@@ -86,6 +93,11 @@ struct llama_moe_cache {
 
     // accumulate one micro-batch of selected experts for a layer
     void observe(int il, const int32_t * ids, int64_t n_used, int64_t n_tokens);
+
+    // read the per-layer selected-expert ids (copied on-graph into ids_all) with
+    // a single transfer and feed them into the counters; the graph that wrote
+    // them must have finished computing
+    void harvest();
 
     // recompute hot sets, promote newly-hot experts (CPU->VRAM), refresh maps.
     // synchronous: blocks until copies + uploads complete. The per-update copy
@@ -115,6 +127,11 @@ private:
 
     std::map<int, llama_moe_cache_layer> layers;
 
+    // [n_used, n_layers] I32; each managed layer cpy's its selected ids into its
+    // row on-graph so the host can read all of them back in one transfer
+    ggml_tensor * ids_all = nullptr;
+    std::vector<int32_t> ids_host; // scratch for reading ids_all
+
     int    n_used = 0;   // experts used per token (hparams.n_expert_used); extra zero-slots per layer
 
     size_t budget_bytes  = 0;
@@ -123,6 +140,11 @@ private:
 
     // exponential decay applied to counters each update() (half-life ~1-2k tokens)
     float  decay = 0.999f;
+
+    // hysteresis: displace a resident expert only when the candidate's count
+    // exceeds the resident's by this factor; without it the top-K boundary
+    // churns every update when activation is near-uniform
+    float  margin = 2.0f;
     int64_t tokens_since_update = 0;
     int64_t update_interval     = 256; // recompute hot set at most this often
     int64_t n_updates           = 0;
