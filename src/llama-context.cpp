@@ -550,6 +550,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
+    // the tagged tensors point into the graphs that were just freed
+    moe_cache_sel.clear();
+    moe_cache_observe_pending = false;
+
     // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache).
     // create before reserving graphs so the worst-case reservation accounts for
     // the extra split/mask nodes it inserts.
@@ -663,6 +667,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // feed the last graph's selected-expert ids into the MoE cache counters (--moe-cache)
+    moe_cache_harvest();
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1277,30 +1284,18 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-bool llama_context::moe_cache_eval(struct ggml_tensor * t, bool ask) {
-    // build_moe_ffn tags the selected-expert tensor of each managed layer as
-    // "moe_cache_sel.<il>"; read its ids and accumulate per-expert counts.
-    static const char * PREFIX = "moe_cache_sel.";
-    const bool want = t->name[0] != '\0' && strncmp(t->name, PREFIX, strlen(PREFIX)) == 0;
-
-    if (ask) {
-        const bool user = cparams.cb_eval ? cparams.cb_eval(t, true, cparams.cb_eval_user_data) : false;
-        return want || user;
+void llama_context::moe_cache_harvest() {
+    if (!moe_cache_observe_pending) {
+        return;
     }
+    moe_cache_observe_pending = false;
 
-    if (want && moe_cache) {
-        const int     il       = atoi(t->name + strlen(PREFIX));
-        const int64_t n_used   = t->ne[0];
-        const int64_t n_tokens = t->ne[1];
-        moe_cache_ids_host.resize(ggml_nbytes(t));
-        ggml_backend_tensor_get(t, moe_cache_ids_host.data(), 0, ggml_nbytes(t));
-        moe_cache->observe(il, (const int32_t *) moe_cache_ids_host.data(), n_used, n_tokens);
+    for (const auto & [il, t] : moe_cache_sel) {
+        const size_t nbytes = ggml_nbytes(t);
+        moe_cache_ids_host.resize(nbytes);
+        ggml_backend_tensor_get(t, moe_cache_ids_host.data(), 0, nbytes);
+        moe_cache->observe(il, (const int32_t *) moe_cache_ids_host.data(), t->ne[0], t->ne[1]);
     }
-
-    if (cparams.cb_eval) {
-        cparams.cb_eval(t, false, cparams.cb_eval_user_data);
-    }
-    return true;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -1313,12 +1308,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
-    // MoE expert cache: refresh the hot set before building/computing this graph,
-    // using activation counts gathered from prior ubatches. Synchronize first so
-    // the synchronous CPU->VRAM promotion does not race an in-flight compute.
-    if (moe_cache && moe_cache->due()) {
-        ggml_backend_sched_synchronize(sched.get());
-        moe_cache->update();
+    if (moe_cache) {
+        // ids from the previous graph must be read before this compute overwrites
+        // them; normally already harvested in synchronize() when logits are read
+        if (moe_cache_observe_pending) {
+            ggml_backend_sched_synchronize(sched.get());
+            moe_cache_harvest();
+        }
+
+        // refresh the hot set using activation counts from prior ubatches.
+        // synchronize first so the synchronous CPU->VRAM promotion does not race
+        // an in-flight compute.
+        if (moe_cache->due()) {
+            ggml_backend_sched_synchronize(sched.get());
+            moe_cache->update();
+        }
     }
 
     // the new graph parameters
@@ -1340,17 +1344,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        static const bool moe_noeval = getenv("MOE_CACHE_NOEVAL") != nullptr;
-        if (moe_cache && !moe_noeval) {
-            // trampoline: feed selected-expert ids into the cache counters, then
-            // forward to any user-installed cb_eval
-            ggml_backend_sched_set_eval_callback(sched.get(),
-                [](struct ggml_tensor * t, bool ask, void * ud) {
-                    return ((llama_context *) ud)->moe_cache_eval(t, ask);
-                }, this);
-        } else {
-            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-        }
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1369,6 +1363,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        // collect the selected-expert tensors tagged by build_moe_ffn; their ids
+        // are read back after compute to drive the MoE cache counters
+        moe_cache_sel.clear();
+        if (moe_cache) {
+            static const char * prefix = "moe_cache_sel.";
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                if (strncmp(t->name, prefix, strlen(prefix)) == 0) {
+                    moe_cache_sel.emplace_back(atoi(t->name + strlen(prefix)), t);
+                }
+            }
+        }
     }
 
     // set the input data for the input tensors
@@ -1386,6 +1393,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (!moe_cache_sel.empty()) {
+        moe_cache_observe_pending = true;
     }
 
     ret = GGML_STATUS_SUCCESS;

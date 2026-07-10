@@ -12,7 +12,7 @@
 // This object owns, per managed layer:
 //   - K+1 VRAM slots per expert role (gate/up/down); the last slot is a zero
 //     expert used as a no-op target.
-//   - three per-expert lookup maps (updated between decodes) that build_moe_ffn
+//   - two per-expert lookup maps (updated between decodes) that build_moe_ffn
 //     reads on-graph to route each selected expert to VRAM (if cached) or CPU.
 //   - decayed per-expert activation counters used to pick the hot set.
 //
@@ -56,14 +56,12 @@ struct llama_moe_cache_layer {
     // per-expert maps, read on-graph via get_rows (shared across roles):
     //   gpu_map[e]  = slot(e)+0.5 if cached else -0.5     (F32; +0.5 so step() works for slot 0)
     //   cpu_map[e]  = 0 (dummy) if cached else e          (I32)
-    //   mask_gpu[e] = 1.0 if cached else 0.0              (F32)
-    //   mask_cpu[e] = 1.0 - mask_gpu[e]                   (F32)
+    // The CPU-branch mask is derived on-graph from step(gpu_map rows); the GPU
+    // branch needs no mask since zero-slot down weights make miss rows zero.
     // A GPU miss is routed on-graph to a distinct zero-slot (K + slot-position) so
     // every id within a token stays distinct, as CUDA mul_mat_id (MMQ) requires.
-    ggml_tensor * gpu_map  = nullptr;
-    ggml_tensor * cpu_map  = nullptr;
-    ggml_tensor * mask_gpu = nullptr;
-    ggml_tensor * mask_cpu = nullptr;
+    ggml_tensor * gpu_map = nullptr;
+    ggml_tensor * cpu_map = nullptr;
 
     // host state
     std::vector<float> counts;         // decayed activation counters [n_expert]
@@ -90,7 +88,8 @@ struct llama_moe_cache {
     void observe(int il, const int32_t * ids, int64_t n_used, int64_t n_tokens);
 
     // recompute hot sets, promote newly-hot experts (CPU->VRAM), refresh maps.
-    // synchronous: blocks until copies + uploads complete.
+    // synchronous: blocks until copies + uploads complete. The per-update copy
+    // volume is bounded by promote_bytes; the remainder waits for later updates.
     void update();
 
     bool enabled() const { return buffer != nullptr && !layers.empty(); }
@@ -118,8 +117,9 @@ private:
 
     int    n_used = 0;   // experts used per token (hparams.n_expert_used); extra zero-slots per layer
 
-    size_t budget_bytes = 0;
-    size_t used_bytes   = 0;
+    size_t budget_bytes  = 0;
+    size_t used_bytes    = 0;
+    size_t promote_bytes = 0;  // max CPU->VRAM copy volume per update()
 
     // exponential decay applied to counters each update() (half-life ~1-2k tokens)
     float  decay = 0.999f;

@@ -1953,9 +1953,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // For managed layers, each expert projection is computed as two mul_mat_ids:
     // one over the VRAM copy of the hot experts (misses routed to distinct zero
     // slots so the ids stay unique), one over the host tensor (cached experts
-    // routed to a masked dummy so their weights are not read from RAM), combined
-    // by a 0/1 mask. Numerically equivalent to running the cached experts on GPU
-    // (as -ot would); host RAM traffic is saved in proportion to the hit rate.
+    // routed to a masked dummy so their weights are not read from RAM). The GPU
+    // branch needs no mask: miss rows are exactly zero because the zero-slot down
+    // weights are zero. Numerically equivalent to running the cached experts on
+    // GPU (as -ot would); host RAM traffic is saved in proportion to the hit rate.
     const llama_moe_cache_layer * mcL =
         cparams.moe_cache ? cparams.moe_cache->get(il) : nullptr;
     // Only single-stream generation (n_tokens == 1): this keeps the host
@@ -1968,13 +1969,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * cache_ids_gpu  = nullptr;
     ggml_tensor * cache_ids_cpu  = nullptr;
-    ggml_tensor * cache_mask_gpu = nullptr;
     ggml_tensor * cache_mask_cpu = nullptr;
     if (use_moe_cache) {
         const int64_t K = mcL->n_slots;
 
         ggml_tensor * sel = ggml_cont(ctx0, selected_experts); // [n_expert_used, 1] I32
         ggml_set_name(sel, (std::string("moe_cache_sel.") + std::to_string(il)).c_str());
+        // read back after compute to feed the activation counters; the output flag
+        // keeps the graph allocator from reusing this memory before it is read
+        ggml_set_output(sel);
         ggml_build_forward_expand(gf, sel);
         ggml_tensor * sel1d = ggml_reshape_1d(ctx0, sel, n_expert_used);
 
@@ -1986,9 +1989,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * gpu_id_f = ggml_add(ctx0, iex, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, iex)));
         cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32), n_expert_used, 1);
 
-        cache_ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map,  sel1d), n_expert_used, 1);
-        cache_mask_gpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_gpu, sel1d), 1, n_expert_used, 1);
-        cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_cpu, sel1d), 1, n_expert_used, 1);
+        cache_ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel1d), n_expert_used, 1);
+        // 1 for misses, 0 for cached experts
+        cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selc, -1.0f, 1.0f), 1, n_expert_used, 1);
     }
     // Expert-FFN activation (gate/up -> activated), used by the cache's two-branch
     // path. Mirrors the inline switch used by the baseline path below; only the
@@ -2061,9 +2064,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         };
         ggml_tensor * e_gpu = branch(cache_ids_gpu, true);
         ggml_tensor * e_cpu = branch(cache_ids_cpu, false);
-        experts = ggml_add(ctx0,
-                    ggml_mul(ctx0, e_gpu, cache_mask_gpu),
-                    ggml_mul(ctx0, e_cpu, cache_mask_cpu));
+        experts = ggml_add(ctx0, e_gpu, ggml_mul(ctx0, e_cpu, cache_mask_cpu));
         cb(experts, "ffn_moe_down", il);
     } else
     if (gate_up_exps) {
