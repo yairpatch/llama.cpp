@@ -10,8 +10,9 @@
 // VRAM instead of RAM.
 //
 // This object owns, per managed layer:
-//   - K+1 VRAM slots per expert role (gate/up/down); the last slot is a zero
-//     expert used as a no-op target.
+//   - K+n VRAM slots per expert role (gate/up/down); the slots past K are zero
+//     experts used as no-op miss targets (n = 1 with MOE_CACHE_DUP_IDS, else
+//     one per miss position).
 //   - two per-expert lookup maps (updated between decodes) that build_moe_ffn
 //     reads on-graph to route each selected expert to VRAM (if cached) or CPU.
 //   - decayed per-expert activation counters used to pick the hot set.
@@ -37,7 +38,7 @@ constexpr int LLAMA_MOE_MAX_ROLES = 3;
 struct llama_moe_cache_layer {
     int il         = -1;
     int n_expert   = 0;
-    int n_slots    = 0;   // K (number of cacheable experts); VRAM tensors hold K+1
+    int n_slots    = 0;   // K (number of cacheable experts); VRAM tensors hold K + zero slots
     int n_roles    = 0;   // number of expert projections managed for this layer
 
     // source (host-resident) expert weight tensors and their VRAM copies (parallel).
@@ -65,6 +66,15 @@ struct llama_moe_cache_layer {
 
     // constant [K+0, .., K+n_used-1] (F32), the per-position zero-slot ids
     ggml_tensor * iex = nullptr;
+
+    // experimental single-zero-slot routing (MOE_CACHE_DUP_IDS): plain I32 slot
+    // map (miss -> K, duplicated across misses) and F32 miss mask, replacing the
+    // distinct-slot id arithmetic. Safe only where CUDA mul_mat_id takes the
+    // batch-1 mmvq path (quantized experts), which tolerates duplicate ids; the
+    // generic fallback path requires distinct ids per token.
+    bool          dup_ids     = false;
+    ggml_tensor * gpu_map_i32 = nullptr;
+    ggml_tensor * mask_map    = nullptr;
 
     // row of the cache-wide ids tensor this layer's selected ids are copied to
     ggml_tensor * ids_all     = nullptr;
@@ -151,6 +161,7 @@ private:
     float  margin = 2.0f;
 
     bool filling = true;  // free slots remain somewhere; shortens the update interval
+    bool dup_ids = false; // single-zero-slot routing (see llama_moe_cache_layer)
 
     // aggregate hit/total counters since the last update (verbose logging)
     int64_t win_hits  = 0;

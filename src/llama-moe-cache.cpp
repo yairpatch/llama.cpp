@@ -55,6 +55,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     if (const char * s = getenv("MOE_CACHE_DECAY"))      decay           = (float) atof(s);
     if (const char * s = getenv("MOE_CACHE_PROMOTE_MB")) promote_bytes   = (size_t) std::max<int64_t>(1, atoll(s)) << 20;
     if (const char * s = getenv("MOE_CACHE_MARGIN"))     margin          = std::max(1.0f, (float) atof(s));
+    dup_ids = getenv("MOE_CACHE_DUP_IDS") != nullptr;
 
     // pick a GPU device / buffer type to host the cache
     ggml_backend_dev_t dev = nullptr;
@@ -87,6 +88,25 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     const int    n_expert         = (int) model.hparams.n_expert;
     n_used = std::max(1, (int) model.hparams.n_expert_used);
 
+    // duplicate ids are only safe on the batch-1 mmvq path (quantized experts)
+    if (dup_ids) {
+        for (int il : candidates) {
+            ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
+            const int n_roles = layer_expert_tensors(model.layers[il], src);
+            for (int r = 0; r < n_roles; ++r) {
+                if (!ggml_is_quantized(src[r]->type)) {
+                    LLAMA_LOG_WARN("%s: MOE_CACHE_DUP_IDS requires quantized experts; ignoring\n", __func__);
+                    dup_ids = false;
+                    break;
+                }
+            }
+            if (!dup_ids) break;
+        }
+    }
+
+    // zero slots per layer: one shared (duplicate ids) or one per miss position
+    const int n_zero = dup_ids ? 1 : n_used;
+
     for (int il : candidates) {
         ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
         const int n_roles = layer_expert_tensors(model.layers[il], src);
@@ -95,8 +115,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         for (int r = 0; r < n_roles; ++r) per_expert_bytes += src[r]->nb[2];
         if (per_expert_bytes == 0) continue;
 
-        // each layer also holds n_used zero-slots (routed misses), so budget those
-        int K = (int) (per_layer_budget / per_expert_bytes) - n_used;
+        int K = (int) (per_layer_budget / per_expert_bytes) - n_zero;
         K = std::min(K, n_expert);
         if (K <= 0) continue;
 
@@ -151,18 +170,26 @@ void llama_moe_cache::alloc_tensors() {
         return;
     }
 
+    const int n_zero = dup_ids ? 1 : n_used;
+
     for (auto & [il, L] : layers) {
         const int K = L.n_slots;
         for (int r = 0; r < L.n_roles; ++r) {
             ggml_tensor * s = L.src[r];
-            // [ne0, ne1, K + n_used]; slots K..K+n_used-1 are distinct zero experts
-            L.vram[r] = ggml_new_tensor_3d(ctx, s->type, s->ne[0], s->ne[1], K + n_used);
+            // [ne0, ne1, K + n_zero]; slots K.. are zero experts (miss targets)
+            L.vram[r] = ggml_new_tensor_3d(ctx, s->type, s->ne[0], s->ne[1], K + n_zero);
         }
         // shape [1, n_expert]: one lookup value per expert row, indexed on-graph
         // by get_rows(map, selected_experts)
-        L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
         L.cpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
-        L.iex     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_used);
+        L.dup_ids = dup_ids;
+        if (dup_ids) {
+            L.gpu_map_i32 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+            L.mask_map    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
+        } else {
+            L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
+            L.iex     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_used);
+        }
     }
 
     ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, layers.size());
@@ -192,9 +219,11 @@ void llama_moe_cache::alloc_tensors() {
             if (zero.size() < nbytes) zero.assign(nbytes, 0);
             ggml_backend_tensor_set(L.vram[r], zero.data(), 0, nbytes);
         }
-        std::vector<float> iex(n_used);
-        for (int i = 0; i < n_used; ++i) iex[i] = (float) (L.n_slots + i);
-        ggml_backend_tensor_set(L.iex, iex.data(), 0, iex.size() * sizeof(float));
+        if (L.iex) {
+            std::vector<float> iex(n_used);
+            for (int i = 0; i < n_used; ++i) iex[i] = (float) (L.n_slots + i);
+            ggml_backend_tensor_set(L.iex, iex.data(), 0, iex.size() * sizeof(float));
+        }
         upload_maps(L); // defaults from slot_of == all -1
     }
     {
@@ -216,16 +245,30 @@ void llama_moe_cache::promote(llama_moe_cache_layer & L, int expert, int slot) {
 }
 
 void llama_moe_cache::upload_maps(llama_moe_cache_layer & L) {
-    std::vector<float>   gpu(L.n_expert);
     std::vector<int32_t> cpu(L.n_expert);
     for (int e = 0; e < L.n_expert; ++e) {
-        const int slot = L.slot_of[e];
-        const bool cached = slot >= 0;
-        gpu[e] = cached ? (float) slot + 0.5f : -0.5f; // slot (+0.5 for step); miss handled on-graph
-        cpu[e] = cached ? 0 : e;                       // dummy 0 for cached (masked out)
+        cpu[e] = L.slot_of[e] >= 0 ? 0 : e; // dummy 0 for cached (masked out)
     }
-    ggml_backend_tensor_set(L.gpu_map, gpu.data(), 0, gpu.size() * sizeof(float));
     ggml_backend_tensor_set(L.cpu_map, cpu.data(), 0, cpu.size() * sizeof(int32_t));
+
+    if (L.dup_ids) {
+        std::vector<int32_t> gpu(L.n_expert);
+        std::vector<float>   mask(L.n_expert);
+        for (int e = 0; e < L.n_expert; ++e) {
+            const int slot = L.slot_of[e];
+            gpu[e]  = slot >= 0 ? slot : L.n_slots; // shared zero slot for misses
+            mask[e] = slot >= 0 ? 0.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(L.gpu_map_i32, gpu.data(),  0, gpu.size()  * sizeof(int32_t));
+        ggml_backend_tensor_set(L.mask_map,    mask.data(), 0, mask.size() * sizeof(float));
+    } else {
+        std::vector<float> gpu(L.n_expert);
+        for (int e = 0; e < L.n_expert; ++e) {
+            const int slot = L.slot_of[e];
+            gpu[e] = slot >= 0 ? (float) slot + 0.5f : -0.5f; // slot (+0.5 for step); miss handled on-graph
+        }
+        ggml_backend_tensor_set(L.gpu_map, gpu.data(), 0, gpu.size() * sizeof(float));
+    }
     L.maps_dirty = false;
 }
 
