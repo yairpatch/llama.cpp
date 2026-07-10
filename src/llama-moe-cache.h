@@ -19,7 +19,17 @@
 //
 // Promotion is synchronous: between decodes, newly hot experts are copied
 // CPU->VRAM and the maps are refreshed. The host copy stays authoritative, so
-// eviction is free and results are bit-identical to the uncached path.
+// eviction is free. Cached experts compute on the GPU, so results match GPU
+// placement (as -ot would give), not the CPU path bit-for-bit.
+//
+// Measured status (Qwen3.6-35B-A3B, RTX 5070 Ti Laptop 12GB): vs experts fully
+// on CPU the cache reaches 60-75% hit rates and +10-25% tg. However, spending
+// the same VRAM on static layer offload (default -fit behavior) performs the
+// same within noise (interleaved A/B, scripts/moe-cache-bench.ps1), since
+// static offload also removes the per-layer CPU round-trip and speeds prefill.
+// The expected niche is models whose per-layer expert tensors are too large
+// for spare VRAM to hold whole layers (multi-GB per layer), where static
+// offload cannot participate but hot-expert slices across all layers can.
 
 #include "ggml.h"
 #include "ggml-backend.h"
