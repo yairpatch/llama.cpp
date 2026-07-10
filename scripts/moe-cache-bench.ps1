@@ -46,8 +46,9 @@ if (-not (Test-Path $Model)) { throw "model not found: $Model" }
 if (-not (Test-Path $Exe))   { throw "llama-server not found: $Exe (pass -Exe or run from build\bin\Release)" }
 
 $configs = @(
-    @{ Name = "static"; Args = @();                              Env = @{} },
-    @{ Name = "hybrid"; Args = @("--moe-cache", "$MoeCacheMiB"); Env = @{ MOE_CACHE_DUP_IDS = "1"; MOE_CACHE_VERBOSE = "1" } }
+    @{ Name = "static";    Args = @();                              Env = @{} },
+    @{ Name = "hybrid";    Args = @("--moe-cache", "$MoeCacheMiB"); Env = @{ MOE_CACHE_DUP_IDS = "1"; MOE_CACHE_VERBOSE = "1" } },
+    @{ Name = "hybrid-ov"; Args = @("--moe-cache", "$MoeCacheMiB"); Env = @{ MOE_CACHE_DUP_IDS = "1"; MOE_CACHE_VERBOSE = "1"; GGML_SCHED_TAIL_OVERLAP = "1" } }
 )
 
 $prompt = "Write a detailed, multi-chapter story about a lighthouse keeper who discovers a hidden library beneath the sea. Include dialogue, rich descriptions, and several plot twists."
@@ -55,7 +56,7 @@ $prompt = "Write a detailed, multi-chapter story about a lighthouse keeper who d
 $resultsDir = Join-Path (Get-Location) ("moe-bench-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 New-Item -ItemType Directory -Path $resultsDir | Out-Null
 
-$moeEnvNames = @("MOE_CACHE_DUP_IDS","MOE_CACHE_VERBOSE","MOE_CACHE_INTERVAL","MOE_CACHE_DECAY","MOE_CACHE_PROMOTE_MB","MOE_CACHE_MARGIN")
+$moeEnvNames = @("MOE_CACHE_DUP_IDS","MOE_CACHE_VERBOSE","MOE_CACHE_INTERVAL","MOE_CACHE_DECAY","MOE_CACHE_PROMOTE_MB","MOE_CACHE_MARGIN","MOE_CACHE_RESERVE_MB","GGML_SCHED_TAIL_OVERLAP")
 
 function Clear-MoeEnv {
     foreach ($n in $moeEnvNames) {
@@ -142,13 +143,14 @@ $summary = $rows | Group-Object config | ForEach-Object {
 $summary | Format-Table -AutoSize | Out-String | Write-Host
 
 $a = $summary | Where-Object { $_.config -eq "static" }
-$b = $summary | Where-Object { $_.config -eq "hybrid" }
-if ($a -and $b -and $a.mean -gt 0) {
-    $delta = [math]::Round(100.0 * ($b.mean - $a.mean) / $a.mean, 1)
-    Write-Host ("hybrid vs static mean: {0}%" -f $delta)
-    if     ($b.min -gt $a.max) { Write-Host "verdict: hybrid clearly faster (ranges do not overlap)" }
-    elseif ($a.min -gt $b.max) { Write-Host "verdict: static clearly faster (ranges do not overlap)" }
-    else                       { Write-Host "verdict: ranges overlap - difference is within run-to-run noise" }
+if ($a -and $a.mean -gt 0) {
+    foreach ($b in ($summary | Where-Object { $_.config -ne "static" })) {
+        $delta = [math]::Round(100.0 * ($b.mean - $a.mean) / $a.mean, 1)
+        Write-Host ("{0} vs static mean: {1}%" -f $b.config, $delta)
+        if     ($b.min -gt $a.max) { Write-Host "  verdict: $($b.config) clearly faster (ranges do not overlap)" }
+        elseif ($a.min -gt $b.max) { Write-Host "  verdict: static clearly faster (ranges do not overlap)" }
+        else                       { Write-Host "  verdict: ranges overlap - difference is within run-to-run noise" }
+    }
 }
 
 Write-Host ""

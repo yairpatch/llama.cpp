@@ -1998,6 +1998,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         cache_ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, 1);
+
+        // pin node order: everything the CPU branch consumes is built before the
+        // GPU-branch matmuls, so the GPU branch forms a trailing segment the
+        // scheduler can overlap with the CPU branch (GGML_SCHED_TAIL_OVERLAP)
+        ggml_build_forward_expand(gf, cache_ids_gpu);
+        ggml_build_forward_expand(gf, cache_ids_cpu);
+        ggml_build_forward_expand(gf, cache_mask_cpu);
     }
     // Expert-FFN activation (gate/up -> activated), used by the cache's two-branch
     // path. Mirrors the inline switch used by the baseline path below; only the
@@ -2069,6 +2076,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return ggml_mul_mat_id(ctx0, W(down_exps), act, ids); // [n_embd, n_used, n_tokens]
         };
         ggml_tensor * e_gpu = branch(cache_ids_gpu, true);
+        ggml_build_forward_expand(gf, e_gpu);
         ggml_tensor * e_cpu = branch(cache_ids_cpu, false);
         experts = ggml_add(ctx0, e_gpu, ggml_mul(ctx0, e_cpu, cache_mask_cpu));
         cb(experts, "ffn_moe_down", il);
