@@ -205,6 +205,13 @@ static void common_params_fit_impl(
         }
     }
 
+    // the MoE expert cache (--moe-cache) allocates on the first GPU device after
+    // loading, invisible to the memory projection; reserve room for it so the
+    // fit does not fill the device and force the driver into paging
+    if (cparams->moe_cache_mb > 0 && nd > 0) {
+        margins[0] += (int64_t) cparams->moe_cache_mb * MiB;
+    }
+
     std::vector<std::string> dev_names;
     {
         dev_names.reserve(nd);

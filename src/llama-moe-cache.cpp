@@ -71,6 +71,28 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     }
     buft = ggml_backend_dev_buffer_type(dev);
 
+    // never overcommit the device: silent driver paging (WDDM) costs far more
+    // than a smaller cache. the reserve covers compute buffers, which are not
+    // allocated yet at this point, plus driver slack.
+    {
+        size_t dev_free = 0, dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        size_t reserve = 1536ull << 20;
+        if (const char * s = getenv("MOE_CACHE_RESERVE_MB")) {
+            reserve = (size_t) std::max<int64_t>(0, atoll(s)) << 20;
+        }
+        if (dev_free <= reserve || (dev_free - reserve) < (64ull << 20)) {
+            LLAMA_LOG_WARN("%s: only %zu MiB free on %s (%zu MiB reserved); MoE expert cache disabled\n",
+                           __func__, dev_free >> 20, ggml_backend_dev_name(dev), reserve >> 20);
+            return;
+        }
+        if (budget_bytes > dev_free - reserve) {
+            LLAMA_LOG_WARN("%s: MoE cache budget %zu MiB exceeds free device memory (%zu MiB free, %zu MiB reserved); clamping to %zu MiB\n",
+                           __func__, budget_bytes >> 20, dev_free >> 20, reserve >> 20, (dev_free - reserve) >> 20);
+            budget_bytes = dev_free - reserve;
+        }
+    }
+
     // collect cacheable layers; layers past n_layer (nextn/MTP) do not run in
     // normal decode, so caching them wastes budget and their slots never fill
     std::vector<int> candidates;
