@@ -22,14 +22,14 @@
 // eviction is free. Cached experts compute on the GPU, so results match GPU
 // placement (as -ot would give), not the CPU path bit-for-bit.
 //
-// Measured status (Qwen3.6-35B-A3B, RTX 5070 Ti Laptop 12GB): vs experts fully
-// on CPU the cache reaches 60-75% hit rates and +10-25% tg. However, spending
-// the same VRAM on static layer offload (default -fit behavior) performs the
-// same within noise (interleaved A/B, scripts/moe-cache-bench.ps1), since
-// static offload also removes the per-layer CPU round-trip and speeds prefill.
-// The expected niche is models whose per-layer expert tensors are too large
-// for spare VRAM to hold whole layers (multi-GB per layer), where static
-// offload cannot participate but hot-expert slices across all layers can.
+// Measured status (Qwen3.6-35B-A3B Q4_K_S, RTX 5070 Ti Laptop 12GB, interleaved
+// A/B via scripts/moe-cache-bench.ps1, cache on top of the default -fit static
+// offload): 60-75% hit rates; +7% tg vs the same VRAM spent purely on static
+// offload, +15% with GGML_SCHED_TAIL_OVERLAP=1 (non-overlapping ranges), which
+// lets the scheduler run the VRAM branch concurrently with the CPU branch.
+// Recommended use: --moe-cache <spare MiB> with GGML_SCHED_TAIL_OVERLAP=1 and
+// without --n-cpu-moe, so -fit places static layers first and the cache uses
+// the remaining headroom.
 
 #include "ggml.h"
 #include "ggml-backend.h"

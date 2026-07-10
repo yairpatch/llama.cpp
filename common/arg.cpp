@@ -2487,9 +2487,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cache"}, "N",
         "VRAM budget in MiB for the dynamic MoE expert cache: keeps the hottest host-resident experts "
-        "in VRAM and refreshes them online (0 = disabled). Mainly useful when per-layer expert tensors "
-        "are too large for spare VRAM to hold whole layers; otherwise spending the same VRAM on static "
-        "offload (default -fit behavior) performs comparably. [EXPERIMENTAL]",
+        "in VRAM and refreshes them online (0 = disabled). Use on top of the default -fit static "
+        "offload (without --n-cpu-moe) and set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU "
+        "expert branches. [EXPERIMENTAL]",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

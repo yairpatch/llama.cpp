@@ -55,7 +55,11 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     if (const char * s = getenv("MOE_CACHE_DECAY"))      decay           = (float) atof(s);
     if (const char * s = getenv("MOE_CACHE_PROMOTE_MB")) promote_bytes   = (size_t) std::max<int64_t>(1, atoll(s)) << 20;
     if (const char * s = getenv("MOE_CACHE_MARGIN"))     margin          = std::max(1.0f, (float) atof(s));
-    dup_ids = getenv("MOE_CACHE_DUP_IDS") != nullptr;
+
+    // single-zero-slot routing; default on, disabled automatically for
+    // non-quantized experts below (MOE_CACHE_DUP_IDS=0 to force off)
+    dup_ids = true;
+    if (const char * s = getenv("MOE_CACHE_DUP_IDS")) dup_ids = atoi(s) != 0;
 
     // pick a GPU device / buffer type to host the cache
     ggml_backend_dev_t dev = nullptr;
@@ -437,4 +441,7 @@ void llama_moe_cache::log_summary() const {
     for (const auto & [il, L] : layers) total_slots += L.n_slots;
     LLAMA_LOG_INFO("%s: MoE expert cache active: %zu layers, %d slots total, %.2f MiB VRAM\n",
                    __func__, layers.size(), total_slots, used_bytes / (1024.0 * 1024.0));
+    if (!getenv("GGML_SCHED_TAIL_OVERLAP")) {
+        LLAMA_LOG_INFO("%s: hint: set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU expert branches\n", __func__);
+    }
 }
