@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -287,6 +288,13 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache); null when disabled
+    std::unique_ptr<llama_moe_cache> moe_cache;
+    std::vector<char> moe_cache_ids_host; // scratch for reading selected-expert ids
+
+    // eval-callback hook that feeds selected-expert ids into the MoE cache counters
+    bool moe_cache_eval(struct ggml_tensor * t, bool ask);
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -233,8 +233,9 @@ llama_context::llama_context(
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
-    cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
+    cparams.op_offload   = params.op_offload;
+    cparams.kv_unified   = params.kv_unified;
+    cparams.moe_cache_mb = params.moe_cache_mb;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -548,6 +549,14 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // dynamic VRAM expert cache for host-resident MoE experts (--moe-cache).
+    // create before reserving graphs so the worst-case reservation accounts for
+    // the extra split/mask nodes it inserts.
+    if (cparams.moe_cache_mb > 0) {
+        moe_cache = std::make_unique<llama_moe_cache>(model, (size_t) cparams.moe_cache_mb << 20);
+        cparams.moe_cache = moe_cache && moe_cache->enabled() ? moe_cache.get() : nullptr;
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1268,6 +1277,32 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::moe_cache_eval(struct ggml_tensor * t, bool ask) {
+    // build_moe_ffn tags the selected-expert tensor of each managed layer as
+    // "moe_cache_sel.<il>"; read its ids and accumulate per-expert counts.
+    static const char * PREFIX = "moe_cache_sel.";
+    const bool want = t->name[0] != '\0' && strncmp(t->name, PREFIX, strlen(PREFIX)) == 0;
+
+    if (ask) {
+        const bool user = cparams.cb_eval ? cparams.cb_eval(t, true, cparams.cb_eval_user_data) : false;
+        return want || user;
+    }
+
+    if (want && moe_cache) {
+        const int     il       = atoi(t->name + strlen(PREFIX));
+        const int64_t n_used   = t->ne[0];
+        const int64_t n_tokens = t->ne[1];
+        moe_cache_ids_host.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, moe_cache_ids_host.data(), 0, ggml_nbytes(t));
+        moe_cache->observe(il, (const int32_t *) moe_cache_ids_host.data(), n_used, n_tokens);
+    }
+
+    if (cparams.cb_eval) {
+        cparams.cb_eval(t, false, cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1277,6 +1312,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
+
+    // MoE expert cache: refresh the hot set before building/computing this graph,
+    // using activation counts gathered from prior ubatches. Synchronize first so
+    // the synchronous CPU->VRAM promotion does not race an in-flight compute.
+    if (moe_cache && moe_cache->due()) {
+        ggml_backend_sched_synchronize(sched.get());
+        moe_cache->update();
+    }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1297,7 +1340,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        static const bool moe_noeval = getenv("MOE_CACHE_NOEVAL") != nullptr;
+        if (moe_cache && !moe_noeval) {
+            // trampoline: feed selected-expert ids into the cache counters, then
+            // forward to any user-installed cb_eval
+            ggml_backend_sched_set_eval_callback(sched.get(),
+                [](struct ggml_tensor * t, bool ask, void * ud) {
+                    return ((llama_context *) ud)->moe_cache_eval(t, ask);
+                }, this);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3423,6 +3476,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.moe_cache_mb                =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

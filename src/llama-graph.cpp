@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1948,6 +1949,83 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // --- dynamic VRAM expert cache (--moe-cache) ------------------------------
+    // For managed layers, each expert projection is computed as two mul_mat_ids:
+    // one over the VRAM copy of the hot experts (misses routed to distinct zero
+    // slots so the ids stay unique), one over the host tensor (cached experts
+    // routed to a masked dummy so their weights are not read from RAM), combined
+    // by a 0/1 mask. Numerically equivalent to running the cached experts on GPU
+    // (as -ot would); host RAM traffic is saved in proportion to the hit rate.
+    const llama_moe_cache_layer * mcL =
+        cparams.moe_cache ? cparams.moe_cache->get(il) : nullptr;
+    // Only single-stream generation (n_tokens == 1): this keeps the host
+    // mul_mat_id on the CPU backend, which tolerates the duplicate dummy ids used
+    // to skip cached experts. Prefill / batched decode (compute-bound, and where
+    // the host op may be offloaded to the CUDA MMQ path that requires distinct
+    // experts per token) falls back to the baseline path.
+    const bool use_moe_cache =
+        mcL && n_tokens == 1 && !weight_before_ffn && (loras == nullptr || loras->empty());
+
+    ggml_tensor * cache_ids_gpu  = nullptr;
+    ggml_tensor * cache_ids_cpu  = nullptr;
+    ggml_tensor * cache_mask_gpu = nullptr;
+    ggml_tensor * cache_mask_cpu = nullptr;
+    if (use_moe_cache) {
+        const int64_t K = mcL->n_slots;
+
+        ggml_tensor * sel = ggml_cont(ctx0, selected_experts); // [n_expert_used, 1] I32
+        ggml_set_name(sel, (std::string("moe_cache_sel.") + std::to_string(il)).c_str());
+        ggml_build_forward_expand(gf, sel);
+        ggml_tensor * sel1d = ggml_reshape_1d(ctx0, sel, n_expert_used);
+
+        // GPU ids: cached -> its slot; miss (slot-position iex) -> distinct zero-slot K+iex.
+        // gpu_map holds slot+0.5 (cached) or -0.5 (miss); step() selects, cast truncates.
+        ggml_tensor * gathered = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map, sel1d), n_expert_used); // F32
+        ggml_tensor * iex      = ggml_arange(ctx0, (float) K, (float) (K + n_expert_used), 1.0f);                // F32 [n_used]
+        ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                     // 1 if cached
+        ggml_tensor * gpu_id_f = ggml_add(ctx0, iex, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, iex)));
+        cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32), n_expert_used, 1);
+
+        cache_ids_cpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map,  sel1d), n_expert_used, 1);
+        cache_mask_gpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_gpu, sel1d), 1, n_expert_used, 1);
+        cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_cpu, sel1d), 1, n_expert_used, 1);
+    }
+    // Expert-FFN activation (gate/up -> activated), used by the cache's two-branch
+    // path. Mirrors the inline switch used by the baseline path below; only the
+    // no-bias/no-scale activation types the cache supports need be correct here.
+    auto apply_moe_act = [&](ggml_tensor * gate, ggml_tensor * up_in) -> ggml_tensor * {
+        const bool has_gate = gate_exps || gate_up_exps;
+        ggml_tensor * g = gate;
+        ggml_tensor * u = up_in;
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                if (gate_exps && il >= 0) {
+                    const float limit = hparams.swiglu_clamp_exp[il];
+                    if (limit > 1e-6f) {
+                        u = ggml_clamp(ctx0, u, -limit, limit);
+                        if (arch == LLM_ARCH_DEEPSEEK4) {
+                            g = ggml_clamp(ctx0, g, -INFINITY, limit);
+                            return ggml_swiglu_split(ctx0, g, u);
+                        }
+                        ggml_tensor * ga = ggml_clamp(ctx0, ggml_silu(ctx0, g), -INFINITY, limit);
+                        return ggml_mul(ctx0, ga, u);
+                    }
+                }
+                return has_gate ? ggml_swiglu_split(ctx0, g, u) : ggml_silu(ctx0, g);
+            case LLM_FFN_GELU:
+                return has_gate ? ggml_geglu_split(ctx0, g, u) : ggml_gelu(ctx0, g);
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                return ggml_swiglu_oai(ctx0, g, u, 1.702f, 7.0f);
+            case LLM_FFN_RELU:
+                return has_gate ? ggml_reglu_split(ctx0, g, u) : ggml_relu(ctx0, g);
+            case LLM_FFN_RELU_SQR:
+                if (has_gate) GGML_ABORT("fatal error: gated squared relu not implemented");
+                return ggml_sqr(ctx0, ggml_relu(ctx0, g));
+            default:
+                GGML_ABORT("fatal error");
+        }
+    };
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -1958,6 +2036,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    if (use_moe_cache) {
+        // whole-FFN split: each device runs a complete expert mini-FFN
+        // (gate/up -> activation -> down) over its own weights and ids, and the
+        // two down outputs are combined once. The GPU branch reads the VRAM copy
+        // of the hot experts (misses -> masked zero slots); the CPU branch reads
+        // the host tensor (cached -> masked dummy, so their weights aren't read
+        // from RAM). Keeping each branch on one device avoids the per-projection
+        // CPU<->GPU round trips that make a per-matmul split latency-bound.
+        auto branch = [&](ggml_tensor * ids, bool cached) -> ggml_tensor * {
+            auto W = [&](ggml_tensor * w) { return cached ? mcL->vram_for(w) : w; };
+            ggml_tensor * bup = nullptr, * bgate = nullptr;
+            if (gate_up_exps) {
+                ggml_tensor * gu = ggml_mul_mat_id(ctx0, W(gate_up_exps), cur, ids); // [n_ff*2, n_used, n_tokens]
+                const int64_t n_ff = gu->ne[0] / 2;
+                bgate = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+                bup   = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff * gu->nb[0]);
+            } else {
+                bup   = ggml_mul_mat_id(ctx0, W(up_exps), cur, ids);
+                bgate = gate_exps ? ggml_mul_mat_id(ctx0, W(gate_exps), cur, ids) : bup;
+            }
+            ggml_tensor * act = apply_moe_act(bgate, bup);
+            return ggml_mul_mat_id(ctx0, W(down_exps), act, ids); // [n_embd, n_used, n_tokens]
+        };
+        ggml_tensor * e_gpu = branch(cache_ids_gpu, true);
+        ggml_tensor * e_cpu = branch(cache_ids_cpu, false);
+        experts = ggml_add(ctx0,
+                    ggml_mul(ctx0, e_gpu, cache_mask_gpu),
+                    ggml_mul(ctx0, e_cpu, cache_mask_cpu));
+        cb(experts, "ffn_moe_down", il);
+    } else
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2008,6 +2116,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    if (!use_moe_cache) {
     const bool has_gate = gate_exps || gate_up_exps;
 
     switch (type_op) {
@@ -2092,6 +2201,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
+    } // !use_moe_cache
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);

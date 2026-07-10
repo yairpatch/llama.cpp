@@ -7,6 +7,8 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct llama_moe_cache;
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -15,6 +17,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
+    uint32_t moe_cache_mb;    // VRAM budget (MiB) for the dynamic MoE expert cache (0 = disabled)
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
@@ -56,4 +59,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // dynamic VRAM expert cache for host-resident MoE experts (nullptr = disabled)
+    const llama_moe_cache * moe_cache = nullptr;
 };
