@@ -190,8 +190,9 @@ void llama_moe_cache::register_layer(int il, int n_slots) {
 }
 
 void llama_moe_cache::alloc_tensors() {
-    // metadata context: per layer -> up to 3 vram + 2 maps + iex, plus ids_all
-    const size_t n_tensors = layers.size() * (LLAMA_MOE_MAX_ROLES + 3);
+    // metadata context: per layer -> up to 3 vram + cpu_map + gpu_map_i32 +
+    // mask_map + gpu_map + iex, plus ids_all and slack
+    const size_t n_tensors = layers.size() * (LLAMA_MOE_MAX_ROLES + 5);
     ggml_init_params ip = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 8),
         /*.mem_buffer =*/ nullptr,
