@@ -11,8 +11,8 @@
 //
 // This object owns, per managed layer:
 //   - K+n VRAM slots per expert role (gate/up/down); the slots past K are zero
-//     experts used as no-op miss targets (n = 1 with MOE_CACHE_DUP_IDS, else
-//     one per miss position).
+//     experts used as no-op miss targets (one per miss position; n = 1 when
+//     duplicate-id routing is on and batch support is off).
 //   - two per-expert lookup maps (updated between decodes) that build_moe_ffn
 //     reads on-graph to route each selected expert to VRAM (if cached) or CPU.
 //   - decayed per-expert activation counters used to pick the hot set.
@@ -44,6 +44,10 @@ struct llama_model;
 // down). We key VRAM copies by the host source-tensor pointer so both layouts
 // work uniformly; build_moe_ffn looks up the copy for whichever tensor it holds.
 constexpr int LLAMA_MOE_MAX_ROLES = 3;
+
+// largest micro-batch the cache path handles (MTP/speculative verification,
+// small batched decode); larger batches fall back to the baseline path
+constexpr int LLAMA_MOE_CACHE_MAX_TOKENS = 8;
 
 struct llama_moe_cache_layer {
     int il         = -1;
@@ -77,12 +81,16 @@ struct llama_moe_cache_layer {
     // constant [K+0, .., K+n_used-1] (F32), the per-position zero-slot ids
     ggml_tensor * iex = nullptr;
 
-    // experimental single-zero-slot routing (MOE_CACHE_DUP_IDS): plain I32 slot
-    // map (miss -> K, duplicated across misses) and F32 miss mask, replacing the
-    // distinct-slot id arithmetic. Safe only where CUDA mul_mat_id takes the
-    // batch-1 mmvq path (quantized experts), which tolerates duplicate ids; the
-    // generic fallback path requires distinct ids per token.
+    // single-zero-slot routing (default; MOE_CACHE_DUP_IDS=0 to force off):
+    // plain I32 slot map (miss -> K, duplicated across misses) and F32 miss
+    // mask, replacing the distinct-slot id arithmetic. Safe only where CUDA
+    // mul_mat_id takes the batch-1 mmvq path (quantized experts), which
+    // tolerates duplicate ids; used for n_tokens == 1 graphs only. Batched
+    // graphs (n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS, when batch_ok) use the
+    // distinct-slot F32 chain, whose ids are unique within every token and
+    // therefore safe on every mul_mat_id path.
     bool          dup_ids     = false;
+    bool          batch_ok    = false;
     ggml_tensor * gpu_map_i32 = nullptr;
     ggml_tensor * mask_map    = nullptr;
 
@@ -116,8 +124,9 @@ struct llama_moe_cache {
 
     // read the per-layer selected-expert ids (copied on-graph into ids_all) with
     // a single transfer and feed them into the counters; the graph that wrote
-    // them must have finished computing
-    void harvest();
+    // them must have finished computing. n_tokens is the token count of that
+    // graph (1 for plain generation, up to LLAMA_MOE_CACHE_MAX_TOKENS batched)
+    void harvest(int64_t n_tokens);
 
     // recompute hot sets, promote newly-hot experts (CPU->VRAM), refresh maps.
     // synchronous: blocks until copies + uploads complete. The per-update copy
@@ -173,8 +182,10 @@ private:
     // churns every update when activation is near-uniform
     float  margin = 2.0f;
 
-    bool filling = true;  // free slots remain somewhere; shortens the update interval
-    bool dup_ids = false; // single-zero-slot routing (see llama_moe_cache_layer)
+    bool filling  = true;  // free slots remain somewhere; shortens the update interval
+    bool dup_ids  = false; // single-zero-slot routing (see llama_moe_cache_layer)
+    bool batch_ok = true;  // serve small batches too (MOE_CACHE_BATCH=0 to disable
+                           // and reclaim the extra zero slots when only doing tg)
 
     // aggregate hit/total counters since the last update (verbose logging)
     int64_t win_hits  = 0;

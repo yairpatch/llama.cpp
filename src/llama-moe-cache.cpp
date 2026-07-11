@@ -60,6 +60,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     // non-quantized experts below (MOE_CACHE_DUP_IDS=0 to force off)
     dup_ids = true;
     if (const char * s = getenv("MOE_CACHE_DUP_IDS")) dup_ids = atoi(s) != 0;
+    if (const char * s = getenv("MOE_CACHE_BATCH"))   batch_ok = atoi(s) != 0;
 
     // pick a GPU device / buffer type to host the cache
     ggml_backend_dev_t dev = nullptr;
@@ -135,8 +136,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         }
     }
 
-    // zero slots per layer: one shared (duplicate ids) or one per miss position
-    const int n_zero = dup_ids ? 1 : n_used;
+    // zero slots per layer: batched graphs route misses to distinct zero slots
+    // (one per position), so batch support needs all of them; single-token
+    // duplicate-id routing shares one
+    const int n_zero = (dup_ids && !batch_ok) ? 1 : n_used;
 
     for (int il : candidates) {
         ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
@@ -201,7 +204,7 @@ void llama_moe_cache::alloc_tensors() {
         return;
     }
 
-    const int n_zero = dup_ids ? 1 : n_used;
+    const int n_zero = (dup_ids && !batch_ok) ? 1 : n_used;
 
     for (auto & [il, L] : layers) {
         const int K = L.n_slots;
@@ -212,18 +215,23 @@ void llama_moe_cache::alloc_tensors() {
         }
         // shape [1, n_expert]: one lookup value per expert row, indexed on-graph
         // by get_rows(map, selected_experts)
-        L.cpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
-        L.dup_ids = dup_ids;
+        L.cpu_map  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
+        L.dup_ids  = dup_ids;
+        L.batch_ok = batch_ok;
         if (dup_ids) {
             L.gpu_map_i32 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
             L.mask_map    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
-        } else {
+        }
+        if (!dup_ids || batch_ok) {
+            // distinct-slot routing chain, used for batched graphs and when
+            // duplicate ids are off
             L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
             L.iex     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_used);
         }
     }
 
-    ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, layers.size());
+    ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32,
+                                 n_used * (batch_ok ? LLAMA_MOE_CACHE_MAX_TOKENS : 1), layers.size());
     {
         int row = 0;
         for (auto & [il, L] : layers) {
@@ -292,7 +300,8 @@ void llama_moe_cache::upload_maps(llama_moe_cache_layer & L) {
         }
         ggml_backend_tensor_set(L.gpu_map_i32, gpu.data(),  0, gpu.size()  * sizeof(int32_t));
         ggml_backend_tensor_set(L.mask_map,    mask.data(), 0, mask.size() * sizeof(float));
-    } else {
+    }
+    if (L.gpu_map) {
         std::vector<float> gpu(L.n_expert);
         for (int e = 0; e < L.n_expert; ++e) {
             const int slot = L.slot_of[e];
@@ -325,14 +334,18 @@ void llama_moe_cache::observe(int il, const int32_t * ids, int64_t n_used, int64
     }
 }
 
-void llama_moe_cache::harvest() {
+void llama_moe_cache::harvest(int64_t n_tokens) {
     if (!enabled()) return;
+
+    const int64_t row = ids_all->ne[0]; // n_used * max tokens
+    n_tokens = std::min<int64_t>(n_tokens, row / n_used);
+    if (n_tokens < 1) return;
 
     ids_host.resize(ggml_nelements(ids_all));
     ggml_backend_tensor_get(ids_all, ids_host.data(), 0, ggml_nbytes(ids_all));
 
     for (auto & [il, L] : layers) {
-        observe(il, ids_host.data() + (size_t) L.harvest_row * n_used, n_used, 1);
+        observe(il, ids_host.data() + (size_t) L.harvest_row * row, n_used, n_tokens);
     }
 }
 

@@ -1294,7 +1294,7 @@ void llama_context::moe_cache_harvest() {
     }
     moe_cache_observe_pending = false;
 
-    moe_cache->harvest();
+    moe_cache->harvest(moe_cache_pending_n_tokens);
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -1395,7 +1395,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (moe_cache_graph_has_ids) {
-        moe_cache_observe_pending = true;
+        moe_cache_observe_pending  = true;
+        moe_cache_pending_n_tokens = ubatch.n_tokens;
     }
 
     ret = GGML_STATUS_SUCCESS;

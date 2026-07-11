@@ -294,8 +294,9 @@ private:
 
     // whether the current graph writes selected-expert ids for the cache, and
     // whether the last computed graph has ids not yet fed into the counters
-    bool moe_cache_graph_has_ids   = false;
-    bool moe_cache_observe_pending = false;
+    bool    moe_cache_graph_has_ids   = false;
+    bool    moe_cache_observe_pending = false;
+    int64_t moe_cache_pending_n_tokens = 1; // token count of the pending graph
 
     // feed the last computed graph's selected-expert ids into the cache
     // counters; the backends must be synchronized

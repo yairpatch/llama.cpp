@@ -1959,13 +1959,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // GPU (as -ot would); host RAM traffic is saved in proportion to the hit rate.
     const llama_moe_cache_layer * mcL =
         cparams.moe_cache ? cparams.moe_cache->get(il) : nullptr;
-    // Only single-stream generation (n_tokens == 1): this keeps the host
-    // mul_mat_id on the CPU backend, which tolerates the duplicate dummy ids used
-    // to skip cached experts. Prefill / batched decode (compute-bound, and where
-    // the host op may be offloaded to the CUDA MMQ path that requires distinct
-    // experts per token) falls back to the baseline path.
+    // Single-token generation always qualifies; small batches (MTP/speculative
+    // verification, multi-slot decode) qualify up to LLAMA_MOE_CACHE_MAX_TOKENS
+    // when the cache allocated per-position zero slots (batch_ok) - batched
+    // graphs use the distinct-slot routing, whose ids are unique within every
+    // token as all CUDA mul_mat_id paths require. Prefill (compute-bound, and
+    // where the host op is offloaded to CUDA) uses the baseline path.
     const bool use_moe_cache =
-        mcL && n_tokens == 1 && !weight_before_ffn && (loras == nullptr || loras->empty());
+        mcL && !weight_before_ffn && (loras == nullptr || loras->empty()) &&
+        (n_tokens == 1 || (mcL->batch_ok && n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS));
 
     ggml_tensor * cache_ids_gpu  = nullptr;
     ggml_tensor * cache_ids_cpu  = nullptr;
@@ -1974,30 +1976,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // stash the selected ids in the cache's persistent ids tensor; the host
         // reads all layers back in one transfer after compute to feed the
         // activation counters
-        ggml_tensor * ids_dst = ggml_view_1d(ctx0, mcL->ids_all, n_expert_used,
+        ggml_tensor * ids_dst = ggml_view_1d(ctx0, mcL->ids_all, n_expert_used * n_tokens,
                                              (size_t) mcL->harvest_row * mcL->ids_all->nb[1]);
-        ggml_tensor * sel = ggml_cpy(ctx0, selected_experts, ids_dst); // [n_expert_used] I32
+        ggml_tensor * sel = ggml_cpy(ctx0, selected_experts, ids_dst); // [n_expert_used * n_tokens] I32
         ggml_set_name(sel, (std::string("moe_cache_sel.") + std::to_string(il)).c_str());
         ggml_build_forward_expand(gf, sel);
 
-        if (mcL->dup_ids) {
+        if (mcL->dup_ids && n_tokens == 1) {
             // single shared zero slot for misses (duplicate ids; batch-1 mmvq only)
             cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map_i32, sel), n_expert_used, 1);
             cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_map,    sel), 1, n_expert_used, 1);
         } else {
             // GPU ids: cached -> its slot; miss (slot-position i) -> distinct zero-slot
-            // iex[i] = K+i. gpu_map holds slot+0.5 (cached) or -0.5 (miss); step()
-            // selects, cast truncates.
-            ggml_tensor * gathered = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map, sel), n_expert_used); // F32
-            ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                    // 1 if cached
-            ggml_tensor * gpu_id_f = ggml_add(ctx0, mcL->iex, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, mcL->iex)));
-            cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32), n_expert_used, 1);
+            // iex[i] = K+i, so ids stay unique within every token. gpu_map holds
+            // slot+0.5 (cached) or -0.5 (miss); step() selects, cast truncates.
+            ggml_tensor * gathered = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map, sel), n_expert_used, n_tokens); // F32
+            ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                              // 1 if cached
+            ggml_tensor * gpu_id_f = ggml_add(ctx0, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, mcL->iex)), mcL->iex);
+            cache_ids_gpu  = ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32); // [n_expert_used, n_tokens]
 
             // 1 for misses, 0 for cached experts
-            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selc, -1.0f, 1.0f), 1, n_expert_used, 1);
+            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selc, -1.0f, 1.0f), 1, n_expert_used, n_tokens);
         }
 
-        cache_ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, 1);
+        cache_ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, n_tokens);
 
         // pin node order: everything the CPU branch consumes is built before the
         // GPU-branch matmuls, so the GPU branch forms a trailing segment the
