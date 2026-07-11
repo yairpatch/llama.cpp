@@ -631,8 +631,11 @@ void llama_context::sched_reserve() {
     // first use. an existing cache (and its counters) is kept across
     // re-reservations.
     // only the default context caches experts: auxiliary contexts (e.g. the MTP
-    // draft context, which shares the model) must not allocate a second cache
-    if (cparams.moe_cache_mb > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !moe_cache) {
+    // draft context, which shares the model) must not allocate a second cache.
+    // memory-measurement contexts (-fit probes, hparams.no_alloc) have no tensor
+    // data to read and must not allocate or distort the measurements either.
+    if (cparams.moe_cache_mb > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        !model.hparams.no_alloc && !moe_cache) {
         // UINT32_MAX = auto: take all remaining free device memory (the cache
         // clamps an oversized budget to what is measured free minus its reserve)
         const size_t budget = cparams.moe_cache_mb == UINT32_MAX ? SIZE_MAX : (size_t) cparams.moe_cache_mb << 20;
