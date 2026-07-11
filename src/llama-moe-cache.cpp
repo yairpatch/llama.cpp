@@ -487,9 +487,23 @@ void llama_moe_cache::update() {
 
 void llama_moe_cache::log_summary() const {
     int total_slots = 0;
-    for (const auto & [il, L] : layers) total_slots += L.n_slots;
-    LLAMA_LOG_INFO("%s: MoE expert cache active: %zu layers, %d slots total, %.2f MiB VRAM\n",
-                   __func__, layers.size(), total_slots, used_bytes / (1024.0 * 1024.0));
+    int min_slots   = INT32_MAX;
+    int n_expert    = 0;
+    for (const auto & [il, L] : layers) {
+        total_slots = total_slots + L.n_slots;
+        min_slots   = std::min(min_slots, L.n_slots);
+        n_expert    = L.n_expert;
+    }
+    LLAMA_LOG_INFO("%s: MoE expert cache active: %zu layers, %d slots total (%.1f%% of experts), %.2f MiB VRAM\n",
+                   __func__, layers.size(), total_slots,
+                   n_expert > 0 ? 100.0 * total_slots / ((double) n_expert * layers.size()) : 0.0,
+                   used_bytes / (1024.0 * 1024.0));
+    if (n_expert > 0 && min_slots < std::max(2 * n_used, n_expert / 20)) {
+        LLAMA_LOG_WARN("%s: only %d slots per layer for %d experts; hit rates will be low and the cache "
+                       "overhead may outweigh its benefit - increase --moe-cache, free device memory, or "
+                       "set MOE_CACHE_BATCH=0 to reclaim the %d zero slots per layer if not batching\n",
+                       __func__, min_slots, n_expert, batch_ok ? n_used : 1);
+    }
     if (!getenv("GGML_SCHED_TAIL_OVERLAP")) {
         LLAMA_LOG_INFO("%s: hint: set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU expert branches\n", __func__);
     }
