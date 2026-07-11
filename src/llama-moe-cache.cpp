@@ -141,8 +141,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         return;
     }
 
-    const size_t per_layer_budget = budget_bytes / candidates.size();
-    const int    n_expert         = (int) model.hparams.n_expert;
+    const int n_expert = (int) model.hparams.n_expert;
     n_used = std::max(1, (int) model.hparams.n_expert_used);
 
     // duplicate ids are only safe on the batch-1 mmvq path (quantized experts)
@@ -165,6 +164,34 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     // (its batches stay on the mmvq path, which tolerates duplicates);
     // distinct-slot routing needs one per miss position
     const int n_zero = dup_ids ? 1 : n_used;
+
+    // if the budget cannot give every layer a useful number of slots, cache an
+    // evenly spaced subset of layers instead of many degenerate caches (or,
+    // with a per-layer slice below one expert, none at all)
+    {
+        size_t per_expert_max = 0;
+        for (int il : candidates) {
+            ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
+            const int n_roles = layer_expert_tensors(model.layers[il], src);
+            size_t b = 0;
+            for (int r = 0; r < n_roles; ++r) b += src[r]->nb[2];
+            per_expert_max = std::max(per_expert_max, b);
+        }
+        const size_t layer_min_bytes = per_expert_max * (size_t) (2 * n_used + n_zero);
+        const size_t n_afford = layer_min_bytes > 0 ? budget_bytes / layer_min_bytes : 0;
+        if (n_afford > 0 && n_afford < candidates.size()) {
+            std::vector<int> subset;
+            subset.reserve(n_afford);
+            for (size_t i = 0; i < n_afford; ++i) {
+                subset.push_back(candidates[i * candidates.size() / n_afford]);
+            }
+            LLAMA_LOG_WARN("%s: budget covers only %zu of %zu MoE layers at a useful size; caching an evenly spaced subset\n",
+                           __func__, n_afford, candidates.size());
+            candidates = std::move(subset);
+        }
+    }
+
+    const size_t per_layer_budget = budget_bytes / candidates.size();
 
     for (int il : candidates) {
         ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
@@ -249,7 +276,6 @@ void llama_moe_cache::alloc_tensors() {
         L.batch_ok = batch_ok;
         if (dup_ids) {
             L.gpu_map_i32 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
-            L.mask_map    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
         } else {
             // distinct-slot routing chain
             L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
@@ -320,20 +346,17 @@ void llama_moe_cache::promote(llama_moe_cache_layer & L, int expert, int slot) {
 void llama_moe_cache::upload_maps(llama_moe_cache_layer & L) {
     std::vector<int32_t> cpu(L.n_expert);
     for (int e = 0; e < L.n_expert; ++e) {
-        cpu[e] = L.slot_of[e] >= 0 ? 0 : e; // dummy 0 for cached (masked out)
+        cpu[e] = L.slot_of[e] >= 0 ? -1 : e; // cached rows are skipped and zeroed by the CPU mul_mat_id
     }
     ggml_backend_tensor_set(L.cpu_map, cpu.data(), 0, cpu.size() * sizeof(int32_t));
 
     if (L.dup_ids) {
         std::vector<int32_t> gpu(L.n_expert);
-        std::vector<float>   mask(L.n_expert);
         for (int e = 0; e < L.n_expert; ++e) {
             const int slot = L.slot_of[e];
-            gpu[e]  = slot >= 0 ? slot : L.n_slots; // shared zero slot for misses
-            mask[e] = slot >= 0 ? 0.0f : 1.0f;
+            gpu[e] = slot >= 0 ? slot : L.n_slots; // shared zero slot for misses
         }
-        ggml_backend_tensor_set(L.gpu_map_i32, gpu.data(),  0, gpu.size()  * sizeof(int32_t));
-        ggml_backend_tensor_set(L.mask_map,    mask.data(), 0, mask.size() * sizeof(float));
+        ggml_backend_tensor_set(L.gpu_map_i32, gpu.data(), 0, gpu.size() * sizeof(int32_t));
     }
     if (L.gpu_map) {
         std::vector<float> gpu(L.n_expert);
@@ -394,9 +417,22 @@ void llama_moe_cache::update() {
 
     filling = false;
 
+    // decay all counters, and collect the layers for round-robin promotion:
+    // starting each update at the layer the previous budget ran out on keeps
+    // early layers from monopolizing the copies during fill or heavy churn
+    std::vector<llama_moe_cache_layer *> ls;
+    ls.reserve(layers.size());
     for (auto & [il, L] : layers) {
-        // decay counters (EMA)
         for (float & c : L.counts) c *= decay;
+        ls.push_back(&L);
+    }
+
+    bool   any_blocked = false;
+    size_t blocked_at  = 0;
+
+    for (size_t k = 0; k < ls.size(); ++k) {
+        const size_t li = (rr_start + k) % ls.size();
+        llama_moe_cache_layer & L = *ls[li];
 
         const int K = L.n_slots;
 
@@ -460,12 +496,18 @@ void llama_moe_cache::update() {
         if (blocked && !free_slots.empty()) {
             filling = true;
         }
+        if (blocked && !any_blocked) {
+            any_blocked = true;
+            blocked_at  = li;
+        }
 
         if (changed) {
             upload_maps(L);
             n_promotions++;
         }
     }
+
+    rr_start = any_blocked ? blocked_at : 0;
 
     n_updates++;
     if (getenv("MOE_CACHE_VERBOSE")) {

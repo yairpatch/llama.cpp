@@ -96,11 +96,13 @@ struct llama_moe_cache_layer {
 
     // per-expert maps, read on-graph via get_rows (shared across roles):
     //   gpu_map[e]  = slot(e)+0.5 if cached else -0.5     (F32; +0.5 so step() works for slot 0)
-    //   cpu_map[e]  = 0 (dummy) if cached else e          (I32)
-    // The CPU-branch mask is derived on-graph from step(gpu_map rows); the GPU
-    // branch needs no mask since zero-slot down weights make miss rows zero.
-    // A GPU miss is routed on-graph to a distinct zero-slot (K + slot-position) so
-    // every id within a token stays distinct, as CUDA mul_mat_id (MMQ) requires.
+    //   cpu_map[e]  = -1 if cached else e                 (I32)
+    // The CPU mul_mat_id skips negative ids and zeroes their output rows, so
+    // cached experts cost the CPU branch nothing and no masking is needed; the
+    // GPU branch needs no mask either since zero-slot down weights make miss
+    // rows zero. A GPU miss is routed on-graph to a distinct zero-slot
+    // (K + slot-position) so every id within a token stays distinct, as CUDA
+    // mul_mat_id (MMQ) requires.
     ggml_tensor * gpu_map = nullptr;
     ggml_tensor * cpu_map = nullptr;
 
@@ -108,17 +110,16 @@ struct llama_moe_cache_layer {
     ggml_tensor * iex = nullptr;
 
     // single-zero-slot routing (default; MOE_CACHE_DUP_IDS=0 to force off):
-    // plain I32 slot map (miss -> K, duplicated across misses) and F32 miss
-    // mask, replacing the distinct-slot id arithmetic. Safe only on the CUDA
-    // mmvq path (quantized experts), which tolerates duplicate ids and covers
-    // batches up to LLAMA_MOE_CACHE_MAX_TOKENS_DUP for every quantized type.
-    // With duplicate ids off, batched graphs up to LLAMA_MOE_CACHE_MAX_TOKENS
-    // use the distinct-slot F32 chain (ids unique within every token, safe on
-    // every mul_mat_id path) at the cost of one zero slot per miss position.
+    // plain I32 slot map (miss -> K, duplicated across misses), replacing the
+    // distinct-slot id arithmetic. Safe only on the CUDA mmvq path (quantized
+    // experts), which tolerates duplicate ids and covers batches up to
+    // LLAMA_MOE_CACHE_MAX_TOKENS_DUP for every quantized type. With duplicate
+    // ids off, batched graphs up to LLAMA_MOE_CACHE_MAX_TOKENS use the
+    // distinct-slot F32 chain (ids unique within every token, safe on every
+    // mul_mat_id path) at the cost of one zero slot per miss position.
     bool          dup_ids     = false;
     bool          batch_ok    = false;
     ggml_tensor * gpu_map_i32 = nullptr;
-    ggml_tensor * mask_map    = nullptr;
 
     // row of the cache-wide ids tensor this layer's selected ids are copied to
     ggml_tensor * ids_all     = nullptr;
@@ -202,6 +203,10 @@ private:
     // 256-token interval this forgets with a half-life of ~13 updates (~3k
     // tokens), letting the hot set track topic drift within a generation
     float  decay = 0.95f;
+
+    // round-robin start for the promotion budget, so layers that were cut off
+    // by an exhausted copy budget get first claim on the next update
+    size_t rr_start = 0;
 
     // hysteresis: displace a resident expert only when the candidate's count
     // exceeds the resident's by this factor; without it the top-K boundary

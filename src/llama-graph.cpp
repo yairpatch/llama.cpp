@@ -1951,12 +1951,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // --- dynamic VRAM expert cache (--moe-cache) ------------------------------
     // For managed layers, each expert projection is computed as two mul_mat_ids:
-    // one over the VRAM copy of the hot experts (misses routed to distinct zero
-    // slots so the ids stay unique), one over the host tensor (cached experts
-    // routed to a masked dummy so their weights are not read from RAM). The GPU
-    // branch needs no mask: miss rows are exactly zero because the zero-slot down
-    // weights are zero. Numerically equivalent to running the cached experts on
-    // GPU (as -ot would); host RAM traffic is saved in proportion to the hit rate.
+    // one over the VRAM copy of the hot experts (misses routed to zero slots
+    // whose weights make their rows exactly zero), one over the host tensor
+    // (cached experts routed to id -1, which the CPU mul_mat_id skips and
+    // zeroes, so their weights are never read from RAM). The branch outputs are
+    // disjoint by construction and combine with a plain add. Numerically
+    // equivalent to running the cached experts on GPU (as -ot would); host RAM
+    // traffic is saved in proportion to the hit rate.
     const llama_moe_cache_layer * mcL =
         cparams.moe_cache ? cparams.moe_cache->get(il) : nullptr;
     // Single-token generation always qualifies; small batches (MTP/speculative
@@ -1975,9 +1976,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         mcL && !weight_before_ffn && (loras == nullptr || loras->empty()) &&
         n_tokens <= cache_max_tokens;
 
-    ggml_tensor * cache_ids_gpu  = nullptr;
-    ggml_tensor * cache_ids_cpu  = nullptr;
-    ggml_tensor * cache_mask_cpu = nullptr;
+    ggml_tensor * cache_ids_gpu = nullptr;
+    ggml_tensor * cache_ids_cpu = nullptr;
     // gathered per-expert scales, [cpu branch, gpu branch]
     ggml_tensor * cache_s_gate_up[2] = { nullptr, nullptr };
     ggml_tensor * cache_s_gate   [2] = { nullptr, nullptr };
@@ -1995,8 +1995,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (mcL->dup_ids) {
             // single shared zero slot for misses (duplicate ids; mmvq path only)
-            cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map_i32, sel), n_expert_used, n_tokens);
-            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_map,    sel), 1, n_expert_used, n_tokens);
+            cache_ids_gpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map_i32, sel), n_expert_used, n_tokens);
         } else {
             // GPU ids: cached -> its slot; miss (slot-position i) -> distinct zero-slot
             // iex[i] = K+i, so ids stay unique within every token. gpu_map holds
@@ -2005,9 +2004,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * selc     = ggml_step(ctx0, gathered);                                                              // 1 if cached
             ggml_tensor * gpu_id_f = ggml_add(ctx0, ggml_mul(ctx0, selc, ggml_sub(ctx0, gathered, mcL->iex)), mcL->iex);
             cache_ids_gpu  = ggml_cast(ctx0, gpu_id_f, GGML_TYPE_I32); // [n_expert_used, n_tokens]
-
-            // 1 for misses, 0 for cached experts
-            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_scale_bias(ctx0, selc, -1.0f, 1.0f), 1, n_expert_used, n_tokens);
         }
 
         cache_ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, n_tokens);
@@ -2043,7 +2039,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // scheduler can overlap with the CPU branch (GGML_SCHED_TAIL_OVERLAP)
         ggml_build_forward_expand(gf, cache_ids_gpu);
         ggml_build_forward_expand(gf, cache_ids_cpu);
-        ggml_build_forward_expand(gf, cache_mask_cpu);
     }
     // Expert-FFN activation (gate/up -> activated), used by the cache's two-branch
     // path. Mirrors the inline switch used by the baseline path below; only the
@@ -2095,10 +2090,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // whole-FFN split: each device runs a complete expert mini-FFN
         // (gate/up -> activation -> down) over its own weights and ids, and the
         // two down outputs are combined once. The GPU branch reads the VRAM copy
-        // of the hot experts (misses -> masked zero slots); the CPU branch reads
-        // the host tensor (cached -> masked dummy, so their weights aren't read
-        // from RAM). Keeping each branch on one device avoids the per-projection
-        // CPU<->GPU round trips that make a per-matmul split latency-bound.
+        // of the hot experts (misses -> zero slots, rows exactly zero); the CPU
+        // branch reads the host tensor (cached -> id -1, skipped and zeroed, so
+        // their weights are never read from RAM). Keeping each branch on one
+        // device avoids the per-projection CPU<->GPU round trips that make a
+        // per-matmul split latency-bound.
         auto branch = [&](ggml_tensor * ids, bool cached) -> ggml_tensor * {
             auto W = [&](ggml_tensor * w) { return cached ? mcL->vram_for(w) : w; };
             ggml_tensor * bup = nullptr, * bgate = nullptr;
@@ -2130,7 +2126,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * e_gpu = branch(cache_ids_gpu, true);
         ggml_build_forward_expand(gf, e_gpu);
         ggml_tensor * e_cpu = branch(cache_ids_cpu, false);
-        experts = ggml_add(ctx0, e_gpu, ggml_mul(ctx0, e_cpu, cache_mask_cpu));
+        experts = ggml_add(ctx0, e_gpu, e_cpu);
         if (cache_s_down[1]) {
             // down scaling is linear per row, applied once on the combined result
             experts = ggml_mul(ctx0, experts, cache_s_down[1]);
