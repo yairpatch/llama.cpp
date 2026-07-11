@@ -2485,16 +2485,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache"}, "N",
+        {"--moe-cache"}, "N|auto",
         "VRAM budget in MiB for the dynamic MoE expert cache: keeps the hottest host-resident experts "
-        "in VRAM and refreshes them online (0 = disabled). Use on top of the default -fit static "
-        "offload (without --n-cpu-moe) and set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU "
-        "expert branches. [EXPERIMENTAL]",
-        [](common_params & params, int value) {
-            if (value < 0) {
+        "in VRAM and refreshes them online (0 = disabled). 'auto' uses whatever device memory is left "
+        "after everything else is placed; an explicit size is additionally reserved during -fit, "
+        "trading statically offloaded layers for cache. Use on top of the default -fit static offload "
+        "(without --n-cpu-moe) and set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU expert "
+        "branches. [EXPERIMENTAL]",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_mb = -1;
+                return;
+            }
+            const int v = std::stoi(value);
+            if (v < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_mb = value;
+            params.moe_cache_mb = v;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

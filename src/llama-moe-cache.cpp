@@ -104,16 +104,24 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         if (const char * s = getenv("MOE_CACHE_RESERVE_MB")) {
             reserve = (size_t) std::max<int64_t>(0, atoll(s)) << 20;
         }
-        const size_t avail = dev_free > reserve ? dev_free - reserve : 0;
-        LLAMA_LOG_INFO("%s: %s: %zu MiB free, %zu MiB reserved, %zu MiB usable for the MoE expert cache (%zu MiB requested)\n",
-                       __func__, ggml_backend_dev_name(dev), dev_free >> 20, reserve >> 20, avail >> 20, budget_bytes >> 20);
+        const bool   is_auto = budget_bytes == SIZE_MAX;
+        const size_t avail   = dev_free > reserve ? dev_free - reserve : 0;
+        if (is_auto) {
+            LLAMA_LOG_INFO("%s: %s: %zu MiB free, %zu MiB reserved, %zu MiB usable for the MoE expert cache (auto)\n",
+                           __func__, ggml_backend_dev_name(dev), dev_free >> 20, reserve >> 20, avail >> 20);
+        } else {
+            LLAMA_LOG_INFO("%s: %s: %zu MiB free, %zu MiB reserved, %zu MiB usable for the MoE expert cache (%zu MiB requested)\n",
+                           __func__, ggml_backend_dev_name(dev), dev_free >> 20, reserve >> 20, avail >> 20, budget_bytes >> 20);
+        }
         if (avail < (64ull << 20)) {
             LLAMA_LOG_WARN("%s: not enough free device memory; MoE expert cache disabled\n", __func__);
             return;
         }
         if (budget_bytes > avail) {
-            LLAMA_LOG_WARN("%s: clamping MoE cache budget %zu MiB -> %zu MiB\n",
-                           __func__, budget_bytes >> 20, avail >> 20);
+            if (!is_auto) {
+                LLAMA_LOG_WARN("%s: clamping MoE cache budget %zu MiB -> %zu MiB\n",
+                               __func__, budget_bytes >> 20, avail >> 20);
+            }
             budget_bytes = avail;
         }
     }

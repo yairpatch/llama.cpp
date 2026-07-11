@@ -630,7 +630,10 @@ void llama_context::sched_reserve() {
     // first use. an existing cache (and its counters) is kept across
     // re-reservations.
     if (cparams.moe_cache_mb > 0 && !moe_cache) {
-        moe_cache = std::make_unique<llama_moe_cache>(model, (size_t) cparams.moe_cache_mb << 20);
+        // UINT32_MAX = auto: take all remaining free device memory (the cache
+        // clamps an oversized budget to what is measured free minus its reserve)
+        const size_t budget = cparams.moe_cache_mb == UINT32_MAX ? SIZE_MAX : (size_t) cparams.moe_cache_mb << 20;
+        moe_cache = std::make_unique<llama_moe_cache>(model, budget);
     }
     cparams.moe_cache = moe_cache && moe_cache->enabled() ? moe_cache.get() : nullptr;
 
