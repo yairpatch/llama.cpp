@@ -161,10 +161,10 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         }
     }
 
-    // zero slots per layer: batched graphs route misses to distinct zero slots
-    // (one per position), so batch support needs all of them; single-token
-    // duplicate-id routing shares one
-    const int n_zero = (dup_ids && !batch_ok) ? 1 : n_used;
+    // zero slots per layer: duplicate-id routing shares one across all misses
+    // (its batches stay on the mmvq path, which tolerates duplicates);
+    // distinct-slot routing needs one per miss position
+    const int n_zero = dup_ids ? 1 : n_used;
 
     for (int il : candidates) {
         ggml_tensor * src[LLAMA_MOE_MAX_ROLES];
@@ -230,7 +230,7 @@ void llama_moe_cache::alloc_tensors() {
         return;
     }
 
-    const int n_zero = (dup_ids && !batch_ok) ? 1 : n_used;
+    const int n_zero = dup_ids ? 1 : n_used;
 
     for (auto & [il, L] : layers) {
         const int K = L.n_slots;
@@ -250,10 +250,8 @@ void llama_moe_cache::alloc_tensors() {
         if (dup_ids) {
             L.gpu_map_i32 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, L.n_expert);
             L.mask_map    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
-        }
-        if (!dup_ids || batch_ok) {
-            // distinct-slot routing chain, used for batched graphs and when
-            // duplicate ids are off
+        } else {
+            // distinct-slot routing chain
             L.gpu_map = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
             L.iex     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_used);
         }
@@ -500,9 +498,8 @@ void llama_moe_cache::log_summary() const {
                    used_bytes / (1024.0 * 1024.0));
     if (n_expert > 0 && min_slots < std::max(2 * n_used, n_expert / 20)) {
         LLAMA_LOG_WARN("%s: only %d slots per layer for %d experts; hit rates will be low and the cache "
-                       "overhead may outweigh its benefit - increase --moe-cache, free device memory, or "
-                       "set MOE_CACHE_BATCH=0 to reclaim the %d zero slots per layer if not batching\n",
-                       __func__, min_slots, n_expert, batch_ok ? n_used : 1);
+                       "overhead may outweigh its benefit - increase --moe-cache or free device memory\n",
+                       __func__, min_slots, n_expert);
     }
     if (!getenv("GGML_SCHED_TAIL_OVERLAP")) {
         LLAMA_LOG_INFO("%s: hint: set GGML_SCHED_TAIL_OVERLAP=1 to overlap the VRAM and CPU expert branches\n", __func__);

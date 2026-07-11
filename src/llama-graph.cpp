@@ -1960,14 +1960,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const llama_moe_cache_layer * mcL =
         cparams.moe_cache ? cparams.moe_cache->get(il) : nullptr;
     // Single-token generation always qualifies; small batches (MTP/speculative
-    // verification, multi-slot decode) qualify up to LLAMA_MOE_CACHE_MAX_TOKENS
-    // when the cache allocated per-position zero slots (batch_ok) - batched
-    // graphs use the distinct-slot routing, whose ids are unique within every
-    // token as all CUDA mul_mat_id paths require. Prefill (compute-bound, and
-    // where the host op is offloaded to CUDA) uses the baseline path.
+    // verification, multi-slot decode) qualify when the cache enabled batch
+    // support. Duplicate-id routing covers batches up to the size every CUDA
+    // mmvq variant accepts; the distinct-slot chain covers larger ones (its ids
+    // are unique within every token, as the other mul_mat_id paths require).
+    // Prefill (compute-bound, and where the host op is offloaded) stays on the
+    // baseline path.
+    const int64_t cache_max_tokens =
+        mcL == nullptr    ? 0 :
+        !mcL->batch_ok    ? 1 :
+        mcL->dup_ids      ? LLAMA_MOE_CACHE_MAX_TOKENS_DUP
+                          : LLAMA_MOE_CACHE_MAX_TOKENS;
     const bool use_moe_cache =
         mcL && !weight_before_ffn && (loras == nullptr || loras->empty()) &&
-        (n_tokens == 1 || (mcL->batch_ok && n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS));
+        n_tokens <= cache_max_tokens;
 
     ggml_tensor * cache_ids_gpu  = nullptr;
     ggml_tensor * cache_ids_cpu  = nullptr;
@@ -1987,10 +1993,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_set_name(sel, (std::string("moe_cache_sel.") + std::to_string(il)).c_str());
         ggml_build_forward_expand(gf, sel);
 
-        if (mcL->dup_ids && n_tokens == 1) {
-            // single shared zero slot for misses (duplicate ids; batch-1 mmvq only)
-            cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map_i32, sel), n_expert_used, 1);
-            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_map,    sel), 1, n_expert_used, 1);
+        if (mcL->dup_ids) {
+            // single shared zero slot for misses (duplicate ids; mmvq path only)
+            cache_ids_gpu  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->gpu_map_i32, sel), n_expert_used, n_tokens);
+            cache_mask_cpu = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, mcL->mask_map,    sel), 1, n_expert_used, n_tokens);
         } else {
             // GPU ids: cached -> its slot; miss (slot-position i) -> distinct zero-slot
             // iex[i] = K+i, so ids stay unique within every token. gpu_map holds

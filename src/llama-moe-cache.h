@@ -11,8 +11,8 @@
 //
 // This object owns, per managed layer:
 //   - K+n VRAM slots per expert role (gate/up/down); the slots past K are zero
-//     experts used as no-op miss targets (one per miss position; n = 1 when
-//     duplicate-id routing is on and batch support is off).
+//     experts used as no-op miss targets (n = 1 with duplicate-id routing, the
+//     default; else one per miss position).
 //   - two per-expert lookup maps (updated between decodes) that build_moe_ffn
 //     reads on-graph to route each selected expert to VRAM (if cached) or CPU.
 //   - decayed per-expert activation counters used to pick the hot set.
@@ -46,8 +46,12 @@ struct llama_model;
 constexpr int LLAMA_MOE_MAX_ROLES = 3;
 
 // largest micro-batch the cache path handles (MTP/speculative verification,
-// small batched decode); larger batches fall back to the baseline path
-constexpr int LLAMA_MOE_CACHE_MAX_TOKENS = 8;
+// small batched decode); larger batches fall back to the baseline path.
+// With duplicate-id routing the cap is 4: the largest MoE id batch every CUDA
+// mmvq variant accepts for every quantized type (get_mmvq_mmid_max_batch);
+// past mmvq, mul_mat_id requires distinct ids per token.
+constexpr int LLAMA_MOE_CACHE_MAX_TOKENS     = 8;
+constexpr int LLAMA_MOE_CACHE_MAX_TOKENS_DUP = 4;
 
 struct llama_moe_cache_layer {
     int il         = -1;
@@ -105,12 +109,12 @@ struct llama_moe_cache_layer {
 
     // single-zero-slot routing (default; MOE_CACHE_DUP_IDS=0 to force off):
     // plain I32 slot map (miss -> K, duplicated across misses) and F32 miss
-    // mask, replacing the distinct-slot id arithmetic. Safe only where CUDA
-    // mul_mat_id takes the batch-1 mmvq path (quantized experts), which
-    // tolerates duplicate ids; used for n_tokens == 1 graphs only. Batched
-    // graphs (n_tokens <= LLAMA_MOE_CACHE_MAX_TOKENS, when batch_ok) use the
-    // distinct-slot F32 chain, whose ids are unique within every token and
-    // therefore safe on every mul_mat_id path.
+    // mask, replacing the distinct-slot id arithmetic. Safe only on the CUDA
+    // mmvq path (quantized experts), which tolerates duplicate ids and covers
+    // batches up to LLAMA_MOE_CACHE_MAX_TOKENS_DUP for every quantized type.
+    // With duplicate ids off, batched graphs up to LLAMA_MOE_CACHE_MAX_TOKENS
+    // use the distinct-slot F32 chain (ids unique within every token, safe on
+    // every mul_mat_id path) at the cost of one zero slot per miss position.
     bool          dup_ids     = false;
     bool          batch_ok    = false;
     ggml_tensor * gpu_map_i32 = nullptr;
