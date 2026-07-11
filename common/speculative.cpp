@@ -2275,8 +2275,9 @@ common_speculative_init_result::common_speculative_init_result(
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
-    cparams.ctx_other = ctx_tgt;
+    cparams.n_rs_seq     = 0;
+    cparams.moe_cache_mb = 0; // the draft context must not allocate a second expert cache
+    cparams.ctx_other    = ctx_tgt;
 
     std::string model_path;
     if (has_draft) {

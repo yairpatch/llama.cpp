@@ -345,6 +345,7 @@ extern "C" {
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         uint32_t moe_cache_mb;      // VRAM budget (MiB) for the dynamic MoE expert cache (0 = disabled, UINT32_MAX = all remaining free device memory) [EXPERIMENTAL]
+        uint32_t moe_cache_reserve_mb; // free device memory (MiB) the MoE expert cache must leave untouched, e.g. for allocations made after context creation (0 = default) [EXPERIMENTAL]
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 

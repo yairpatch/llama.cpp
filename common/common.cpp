@@ -1595,6 +1595,20 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.moe_cache_mb      = params.moe_cache_mb < 0 ? UINT32_MAX : (uint32_t) params.moe_cache_mb;
+
+    // speculative decoding allocates a second context (KV, recurrent state,
+    // compute buffers) after this context - and after the MoE expert cache -
+    // is created; have the cache leave room for it (MOE_CACHE_RESERVE_MB
+    // overrides)
+    cparams.moe_cache_reserve_mb = 0;
+    if (cparams.moe_cache_mb > 0) {
+        const bool spec_on = params.speculative.has_dft() ||
+            std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+                        [](enum common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (spec_on) {
+            cparams.moe_cache_reserve_mb = 2048;
+        }
+    }
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

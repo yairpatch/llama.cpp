@@ -133,7 +133,9 @@ struct llama_moe_cache_layer {
 };
 
 struct llama_moe_cache {
-    llama_moe_cache(const llama_model & model, size_t budget_bytes);
+    // reserve_bytes: free device memory to leave untouched (0 = default 512 MiB;
+    // the MOE_CACHE_RESERVE_MB env var overrides both)
+    llama_moe_cache(const llama_model & model, size_t budget_bytes, size_t reserve_bytes = 0);
     ~llama_moe_cache();
 
     // whether the layer is managed by the cache
@@ -197,6 +199,7 @@ private:
 
     size_t budget_bytes  = 0;
     size_t used_bytes    = 0;
+    size_t reserve_bytes = 0;  // free device memory to leave untouched
     size_t promote_bytes = 0;  // max CPU->VRAM copy volume per update()
 
     // exponential decay applied to counters each update(); at the default

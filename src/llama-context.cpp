@@ -235,7 +235,8 @@ llama_context::llama_context(
 
     cparams.op_offload   = params.op_offload;
     cparams.kv_unified   = params.kv_unified;
-    cparams.moe_cache_mb = params.moe_cache_mb;
+    cparams.moe_cache_mb         = params.moe_cache_mb;
+    cparams.moe_cache_reserve_mb = params.moe_cache_reserve_mb;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -629,11 +630,13 @@ void llama_context::sched_reserve() {
     // reservations above; they are small and ggml-alloc grows into them on
     // first use. an existing cache (and its counters) is kept across
     // re-reservations.
-    if (cparams.moe_cache_mb > 0 && !moe_cache) {
+    // only the default context caches experts: auxiliary contexts (e.g. the MTP
+    // draft context, which shares the model) must not allocate a second cache
+    if (cparams.moe_cache_mb > 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !moe_cache) {
         // UINT32_MAX = auto: take all remaining free device memory (the cache
         // clamps an oversized budget to what is measured free minus its reserve)
         const size_t budget = cparams.moe_cache_mb == UINT32_MAX ? SIZE_MAX : (size_t) cparams.moe_cache_mb << 20;
-        moe_cache = std::make_unique<llama_moe_cache>(model, budget);
+        moe_cache = std::make_unique<llama_moe_cache>(model, budget, (size_t) cparams.moe_cache_reserve_mb << 20);
     }
     cparams.moe_cache = moe_cache && moe_cache->enabled() ? moe_cache.get() : nullptr;
 
@@ -3491,6 +3494,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.moe_cache_mb                =*/ 0,
+        /*.moe_cache_reserve_mb        =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

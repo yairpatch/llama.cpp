@@ -59,8 +59,8 @@ static int layer_expert_tensors(const llama_layer & l, ggml_tensor * src[LLAMA_M
     return n;
 }
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
-    : model(model), budget_bytes(budget_bytes) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes, size_t reserve_bytes)
+    : model(model), budget_bytes(budget_bytes), reserve_bytes(reserve_bytes) {
 
     if (budget_bytes == 0) {
         return;
@@ -100,7 +100,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
     {
         size_t dev_free = 0, dev_total = 0;
         ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-        size_t reserve = 512ull << 20;
+        size_t reserve = reserve_bytes > 0 ? reserve_bytes : 512ull << 20;
         if (const char * s = getenv("MOE_CACHE_RESERVE_MB")) {
             reserve = (size_t) std::max<int64_t>(0, atoll(s)) << 20;
         }
