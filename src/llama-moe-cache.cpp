@@ -11,34 +11,51 @@
 #include <numeric>
 
 // A layer is cacheable in either the merged (gate_up + down) or separate
-// (gate + up + down) configuration, with no expert biases or per-expert scales.
-// This covers Qwen3-MoE / Qwen3.5-MoE and similar and keeps the split path
-// numerically equivalent to the baseline. Biased or scaled experts fall back to
-// the uncached path.
+// (gate + up + down) configuration. Per-expert output scales (Gemma 4 / NVFP4
+// style *_exps_s, plain F32 [n_expert]) are supported and returned per role in
+// src_s; per-expert biases are not, and fall back to the uncached path.
 //
-// Fills `src` with the managed host expert tensors and returns the count (0 if
-// the layer is not cacheable).
-static int layer_expert_tensors(const llama_layer & l, ggml_tensor * src[LLAMA_MOE_MAX_ROLES]) {
+// Fills `src` (and optionally `src_s`) with the managed host expert tensors and
+// returns the count (0 if the layer is not cacheable).
+static int layer_expert_tensors(const llama_layer & l, ggml_tensor * src[LLAMA_MOE_MAX_ROLES],
+                                ggml_tensor * src_s[LLAMA_MOE_MAX_ROLES] = nullptr) {
     if (!l.ffn_down_exps) return 0;
     if (l.ffn_down_exps_b || l.ffn_up_exps_b || l.ffn_gate_exps_b || l.ffn_gate_up_exps_b) return 0;
-    if (l.ffn_down_exps_s || l.ffn_up_exps_s || l.ffn_gate_exps_s) return 0;
+
+    // scales are gathered and multiplied on-graph; only plain F32 vectors are handled
+    for (ggml_tensor * s : { l.ffn_down_exps_s, l.ffn_up_exps_s, l.ffn_gate_exps_s }) {
+        if (s && (s->type != GGML_TYPE_F32 || ggml_nelements(s) != s->ne[0])) return 0;
+    }
 
     // experts must be host-resident (for the CPU->VRAM promotion copy to read a
     // valid host pointer, and for the cache to actually remove RAM traffic)
     if (!l.ffn_down_exps->buffer || !ggml_backend_buffer_is_host(l.ffn_down_exps->buffer)) return 0;
 
+    ggml_tensor * scales[LLAMA_MOE_MAX_ROLES] = { nullptr, nullptr, nullptr };
+
     int n = 0;
     if (l.ffn_gate_up_exps) {
-        // merged gate_up path
-        src[n++] = l.ffn_gate_up_exps;
+        // merged gate_up path; up_exps_s scales the whole merged result,
+        // mirroring build_moe_ffn
+        scales[n] = l.ffn_up_exps_s;
+        src[n++]  = l.ffn_gate_up_exps;
     } else if (l.ffn_gate_exps && l.ffn_up_exps) {
         // separate gate and up path
-        src[n++] = l.ffn_gate_exps;
-        src[n++] = l.ffn_up_exps;
+        scales[n] = l.ffn_gate_exps_s;
+        src[n++]  = l.ffn_gate_exps;
+        scales[n] = l.ffn_up_exps_s;
+        src[n++]  = l.ffn_up_exps;
     } else {
         return 0;
     }
-    src[n++] = l.ffn_down_exps;
+    scales[n] = l.ffn_down_exps_s;
+    src[n++]  = l.ffn_down_exps;
+
+    if (src_s) {
+        for (int r = 0; r < LLAMA_MOE_MAX_ROLES; ++r) {
+            src_s[r] = scales[r];
+        }
+    }
     return n;
 }
 
@@ -112,7 +129,7 @@ llama_moe_cache::llama_moe_cache(const llama_model & model, size_t budget_bytes)
         }
     }
     if (candidates.empty()) {
-        LLAMA_LOG_WARN("%s: no cacheable MoE layers (need host-resident, unbiased experts); cache disabled\n", __func__);
+        LLAMA_LOG_WARN("%s: no cacheable MoE layers (need host-resident experts without per-expert biases); cache disabled\n", __func__);
         return;
     }
 
@@ -180,7 +197,7 @@ void llama_moe_cache::register_layer(int il, int n_slots) {
     L.il       = il;
     L.n_expert = n_expert;
     L.n_slots  = n_slots;
-    L.n_roles  = layer_expert_tensors(model.layers[il], L.src);
+    L.n_roles  = layer_expert_tensors(model.layers[il], L.src, L.src_s);
 
     L.counts.assign(n_expert, 0.0f);
     L.slot_of.assign(n_expert, -1);
@@ -190,9 +207,9 @@ void llama_moe_cache::register_layer(int il, int n_slots) {
 }
 
 void llama_moe_cache::alloc_tensors() {
-    // metadata context: per layer -> up to 3 vram + cpu_map + gpu_map_i32 +
-    // mask_map + gpu_map + iex, plus ids_all and slack
-    const size_t n_tensors = layers.size() * (LLAMA_MOE_MAX_ROLES + 5);
+    // metadata context: per layer -> up to 3 vram + 3 scales + cpu_map +
+    // gpu_map_i32 + mask_map + gpu_map + iex, plus ids_all and slack
+    const size_t n_tensors = layers.size() * (2 * LLAMA_MOE_MAX_ROLES + 5);
     ggml_init_params ip = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 8),
         /*.mem_buffer =*/ nullptr,
@@ -213,6 +230,9 @@ void llama_moe_cache::alloc_tensors() {
             ggml_tensor * s = L.src[r];
             // [ne0, ne1, K + n_zero]; slots K.. are zero experts (miss targets)
             L.vram[r] = ggml_new_tensor_3d(ctx, s->type, s->ne[0], s->ne[1], K + n_zero);
+            if (L.src_s[r]) {
+                L.vram_s[r] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, L.n_expert);
+            }
         }
         // shape [1, n_expert]: one lookup value per expert row, indexed on-graph
         // by get_rows(map, selected_experts)
@@ -263,6 +283,13 @@ void llama_moe_cache::alloc_tensors() {
             std::vector<float> iex(n_used);
             for (int i = 0; i < n_used; ++i) iex[i] = (float) (L.n_slots + i);
             ggml_backend_tensor_set(L.iex, iex.data(), 0, iex.size() * sizeof(float));
+        }
+        // per-expert scales are static; copy the full vectors once
+        for (int r = 0; r < L.n_roles; ++r) {
+            if (!L.vram_s[r]) continue;
+            std::vector<float> svals(L.n_expert);
+            ggml_backend_tensor_get(L.src_s[r], svals.data(), 0, svals.size() * sizeof(float));
+            ggml_backend_tensor_set(L.vram_s[r], svals.data(), 0, svals.size() * sizeof(float));
         }
         upload_maps(L); // defaults from slot_of == all -1
     }

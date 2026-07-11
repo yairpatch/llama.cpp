@@ -1972,6 +1972,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * cache_ids_gpu  = nullptr;
     ggml_tensor * cache_ids_cpu  = nullptr;
     ggml_tensor * cache_mask_cpu = nullptr;
+    // gathered per-expert scales, [cpu branch, gpu branch]
+    ggml_tensor * cache_s_gate_up[2] = { nullptr, nullptr };
+    ggml_tensor * cache_s_gate   [2] = { nullptr, nullptr };
+    ggml_tensor * cache_s_up     [2] = { nullptr, nullptr };
+    ggml_tensor * cache_s_down   [2] = { nullptr, nullptr };
     if (use_moe_cache) {
         // stash the selected ids in the cache's persistent ids tensor; the host
         // reads all layers back in one transfer after compute to feed the
@@ -2000,6 +2005,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         cache_ids_cpu = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, mcL->cpu_map, sel), n_expert_used, n_tokens);
+
+        // per-expert output scales (Gemma 4 / NVFP4), gathered by the original
+        // expert ids. Each branch gathers from its own device's copy - the host
+        // tensor for the CPU branch (its weights buffer keeps those ops on the
+        // CPU; not expanded here so they land inside the CPU-branch split), the
+        // VRAM copy for the GPU branch - so neither branch bounces devices.
+        auto gather_scales = [&](ggml_tensor * w, ggml_tensor * out[2], bool host_too) {
+            ggml_tensor * sv[2] = { w && host_too ? mcL->host_s_for(w) : nullptr,
+                                    w             ? mcL->vram_s_for(w) : nullptr };
+            for (int b = 0; b < 2; ++b) {
+                if (sv[b] == nullptr) {
+                    continue;
+                }
+                // the host tensor is a plain [n_expert] vector; get_rows needs [1, n_expert]
+                ggml_tensor * s2 = sv[b]->ne[1] == 1 ? ggml_reshape_2d(ctx0, sv[b], 1, sv[b]->ne[0]) : sv[b];
+                out[b] = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, s2, sel), 1, n_expert_used, n_tokens);
+                if (b == 1) {
+                    ggml_build_forward_expand(gf, out[b]);
+                }
+            }
+        };
+        gather_scales(gate_up_exps, cache_s_gate_up, true);
+        gather_scales(gate_exps,    cache_s_gate,    true);
+        gather_scales(up_exps,      cache_s_up,      true);
+        // the down scale is linear and applied once post-combine on the GPU
+        gather_scales(down_exps,    cache_s_down,    false);
 
         // pin node order: everything the CPU branch consumes is built before the
         // GPU-branch matmuls, so the GPU branch forms a trailing segment the
@@ -2067,12 +2098,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * bup = nullptr, * bgate = nullptr;
             if (gate_up_exps) {
                 ggml_tensor * gu = ggml_mul_mat_id(ctx0, W(gate_up_exps), cur, ids); // [n_ff*2, n_used, n_tokens]
+                if (cache_s_gate_up[cached]) {
+                    gu = ggml_mul(ctx0, gu, cache_s_gate_up[cached]);
+                }
                 const int64_t n_ff = gu->ne[0] / 2;
                 bgate = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
                 bup   = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff * gu->nb[0]);
             } else {
-                bup   = ggml_mul_mat_id(ctx0, W(up_exps), cur, ids);
-                bgate = gate_exps ? ggml_mul_mat_id(ctx0, W(gate_exps), cur, ids) : bup;
+                bup = ggml_mul_mat_id(ctx0, W(up_exps), cur, ids);
+                if (cache_s_up[cached]) {
+                    bup = ggml_mul(ctx0, bup, cache_s_up[cached]);
+                }
+                if (gate_exps) {
+                    bgate = ggml_mul_mat_id(ctx0, W(gate_exps), cur, ids);
+                    if (cache_s_gate[cached]) {
+                        bgate = ggml_mul(ctx0, bgate, cache_s_gate[cached]);
+                    }
+                } else {
+                    bgate = bup;
+                }
             }
             ggml_tensor * act = apply_moe_act(bgate, bup);
             return ggml_mul_mat_id(ctx0, W(down_exps), act, ids); // [n_embd, n_used, n_tokens]
@@ -2081,6 +2125,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, e_gpu);
         ggml_tensor * e_cpu = branch(cache_ids_cpu, false);
         experts = ggml_add(ctx0, e_gpu, ggml_mul(ctx0, e_cpu, cache_mask_cpu));
+        if (cache_s_down[1]) {
+            // down scaling is linear per row, applied once on the combined result
+            experts = ggml_mul(ctx0, experts, cache_s_down[1]);
+        }
         cb(experts, "ffn_moe_down", il);
     } else
     if (gate_up_exps) {

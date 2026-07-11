@@ -60,10 +60,32 @@ struct llama_moe_cache_layer {
     ggml_tensor * src [LLAMA_MOE_MAX_ROLES] = { nullptr, nullptr, nullptr };
     ggml_tensor * vram[LLAMA_MOE_MAX_ROLES] = { nullptr, nullptr, nullptr };
 
+    // per-expert output scales aligned with src (nullptr when the role has
+    // none); vram_s holds a full F32 [1, n_expert] copy, gathered on-graph by
+    // the original expert ids (Gemma 4 / NVFP4 style *_exps_s)
+    ggml_tensor * src_s [LLAMA_MOE_MAX_ROLES] = { nullptr, nullptr, nullptr };
+    ggml_tensor * vram_s[LLAMA_MOE_MAX_ROLES] = { nullptr, nullptr, nullptr };
+
     // VRAM copy for a given host source tensor, or nullptr if not managed
     ggml_tensor * vram_for(const ggml_tensor * s) const {
         for (int r = 0; r < n_roles; ++r) {
             if (src[r] == s) return vram[r];
+        }
+        return nullptr;
+    }
+
+    // VRAM scale copy for a given host weight tensor, or nullptr
+    ggml_tensor * vram_s_for(const ggml_tensor * s) const {
+        for (int r = 0; r < n_roles; ++r) {
+            if (src[r] == s) return vram_s[r];
+        }
+        return nullptr;
+    }
+
+    // host scale tensor for a given host weight tensor, or nullptr
+    ggml_tensor * host_s_for(const ggml_tensor * s) const {
+        for (int r = 0; r < n_roles; ++r) {
+            if (src[r] == s) return src_s[r];
         }
         return nullptr;
     }
